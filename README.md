@@ -7,7 +7,7 @@ captured alongside.
 
 Zero dependencies (pure Python stdlib, 3.9+). One file, one command.
 
-> Sibling project of [claude-cowork-export](https://github.com/<GITHUB_USER>/claude-cowork-export),
+> Sibling project of [claude-cowork-export](https://github.com/PeriChu/claude-cowork-export),
 > which targets Claude Desktop's Cowork chats. This one is for the CLI tool.
 
 ## Why
@@ -38,13 +38,13 @@ Requires Python 3.9+.
 Recommended (isolated, gives you a `claude-code-export` command on PATH):
 
 ```bash
-pipx install git+https://github.com/<GITHUB_USER>/claude-code-export.git
+pipx install git+https://github.com/PeriChu/claude-code-export.git
 ```
 
 Or just clone and run the script directly — it has no third-party deps:
 
 ```bash
-git clone https://github.com/<GITHUB_USER>/claude-code-export.git
+git clone https://github.com/PeriChu/claude-code-export.git
 cd claude-code-export
 python3 claude_code_export.py --help
 ```
