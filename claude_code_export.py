@@ -1,0 +1,1423 @@
+#!/usr/bin/env python3
+"""claude_code_export — export Claude Code CLI sessions to HTML / Markdown / JSON / CSV.
+
+Claude Code stores each session as a JSONL transcript under
+``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`` on every platform
+(macOS, Linux, Windows alike — Claude Code is a CLI tool, not a Microsoft
+Store app). This tool:
+
+  * discovers every transcript on disk
+  * groups them by the actual working directory (decoded from the encoded
+    project folder name, with the transcript's own ``cwd`` record winning
+    when present)
+  * flattens the JSONL into HTML / Markdown / JSON / CSV bundles with the
+    conversation grouped into per-turn collapsible blocks
+  * snapshots files the assistant Wrote / Edited (falling back to the
+    recorded content from the tool call when the live file is missing or
+    unreadable)
+  * bundles the project's ``CLAUDE.md`` (or ``.claude/CLAUDE.md``) when one
+    exists, so the export carries the context the assistant was operating
+    under
+
+Usage:
+    python claude_code_export.py list
+    python claude_code_export.py list --project ~/code/foo
+    python claude_code_export.py export latest
+    python claude_code_export.py export <session-id-prefix>
+    python claude_code_export.py export all --output ./exports
+    python claude_code_export.py export latest --formats html,md
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import html as html_mod
+import json
+import os
+import shutil
+import sys
+import textwrap
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+HOME = Path.home()
+CODE_ROOT = HOME / ".claude" / "projects"
+DEFAULT_OUTPUT = Path.cwd() / "exports"
+SUPPORTED_FORMATS = ("html", "md", "json", "csv")
+TOOL_RESULT_TRUNCATE = 8000
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def _decode_cwd_dir(name: str) -> str:
+    """Best-effort decode of Claude Code's encoded project directory name.
+
+    Claude Code encodes the cwd by replacing the path separator with ``-`` and
+    prepending one. Concrete examples:
+
+      ``/home/me/code/my-project``  →  ``-home-me-code-my-project``
+      ``C:\\code\\my-project``                →  ``C--code-my-project``
+
+    Underscores in the original path are also replaced with ``-``, so the
+    encoding is not perfectly reversible. We return a best-effort decode —
+    the transcript's own ``cwd`` field always wins when present.
+    """
+    if not name:
+        return ""
+    if name.startswith("-"):
+        # POSIX-style absolute path encoding: leading "-" stands for "/"
+        return "/" + name[1:].replace("-", "/")
+    # Windows-style encoding: first "-" after the drive letter stands for ":\\"
+    if len(name) >= 2 and name[0].isalpha() and name[1:3] == "--":
+        return f"{name[0]}:\\" + name[3:].replace("-", "\\")
+    return name.replace("-", "/")
+
+
+def _find_project_claude_md(cwd: str) -> Path | None:
+    """Look for the project's CLAUDE.md (or .claude/CLAUDE.md). Returns the
+    first existing path, or None."""
+    if not cwd:
+        return None
+    cwd_p = Path(cwd).expanduser()
+    for candidate in (cwd_p / "CLAUDE.md", cwd_p / ".claude" / "CLAUDE.md"):
+        try:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Task:
+    task_id: str                              # = session UUID (jsonl stem)
+    title: str = ""                           # from ai-title record
+    cwd: str = ""                             # authoritative cwd from transcript
+    decoded_cwd: str = ""                     # fallback decoded from dir name
+    git_branch: str = ""
+    version: str = ""
+    entrypoint: str = ""
+    permission_mode: str = ""
+    project_dir: Path | None = None           # ~/.claude/projects/<encoded>/
+    transcript_path: Path | None = None
+    created_at_ms: int = 0
+    last_activity_ms: int = 0
+
+    @property
+    def display_when(self) -> str:
+        ts = self.last_activity_ms or self.created_at_ms
+        if not ts:
+            return ""
+        return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M")
+
+    @property
+    def display_title(self) -> str:
+        return self.title or f"(untitled session {self.task_id[:8]})"
+
+    @property
+    def effective_cwd(self) -> str:
+        return self.cwd or self.decoded_cwd
+
+
+def _peek_session_meta(jsonl_path: Path, scan_limit: int = 120) -> dict[str, Any]:
+    """One-pass scan of a transcript's first N records to pick up display
+    metadata (title, cwd, git_branch, version, entrypoint, permission_mode,
+    first/last timestamps). Skipping `scan_limit` keeps `list` fast on very
+    long transcripts."""
+    out: dict[str, Any] = {
+        "title": "", "cwd": "", "git_branch": "", "version": "",
+        "entrypoint": "", "permission_mode": "",
+        "started_at_ms": 0, "ended_at_ms": 0,
+    }
+    if not jsonl_path.exists():
+        return out
+    scanned = 0
+    try:
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if scanned >= scan_limit and all(
+                    out[k] for k in ("title", "cwd", "git_branch", "version")
+                ):
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                scanned += 1
+                if not out["cwd"] and obj.get("cwd"):
+                    out["cwd"] = obj["cwd"]
+                if not out["git_branch"] and obj.get("gitBranch"):
+                    out["git_branch"] = obj["gitBranch"]
+                if not out["version"] and obj.get("version"):
+                    out["version"] = obj["version"]
+                if not out["entrypoint"] and obj.get("entrypoint"):
+                    out["entrypoint"] = obj["entrypoint"]
+                if not out["permission_mode"] and obj.get("permissionMode"):
+                    out["permission_mode"] = obj["permissionMode"]
+                if obj.get("type") == "ai-title" and obj.get("aiTitle"):
+                    out["title"] = obj["aiTitle"]
+                ts = obj.get("timestamp")
+                if ts:
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        ms = int(dt.timestamp() * 1000)
+                        if not out["started_at_ms"]:
+                            out["started_at_ms"] = ms
+                        out["ended_at_ms"] = ms
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return out
+
+
+def discover_sessions(roots: list[Path] | None = None) -> list[Task]:
+    """Walk ~/.claude/projects/<encoded>/*.jsonl and return Task records,
+    newest first by last_activity_ms (which is the file mtime fallback
+    when the transcript has no timestamps yet)."""
+    if roots is None:
+        roots = [CODE_ROOT] if CODE_ROOT.exists() else []
+    out: list[Task] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for proj in sorted(root.iterdir()):
+            if not proj.is_dir():
+                continue
+            decoded = _decode_cwd_dir(proj.name)
+            for jf in proj.glob("*.jsonl"):
+                if jf.stem in seen:
+                    continue
+                seen.add(jf.stem)
+                meta = _peek_session_meta(jf)
+                try:
+                    mtime_ms = int(jf.stat().st_mtime * 1000)
+                except OSError:
+                    mtime_ms = 0
+                out.append(Task(
+                    task_id=jf.stem,
+                    title=meta["title"],
+                    cwd=meta["cwd"],
+                    decoded_cwd=decoded,
+                    git_branch=meta["git_branch"],
+                    version=meta["version"],
+                    entrypoint=meta["entrypoint"],
+                    permission_mode=meta["permission_mode"],
+                    project_dir=proj,
+                    transcript_path=jf,
+                    created_at_ms=meta["started_at_ms"] or mtime_ms,
+                    last_activity_ms=meta["ended_at_ms"] or mtime_ms,
+                ))
+    out.sort(key=lambda t: t.last_activity_ms or t.created_at_ms, reverse=True)
+    return out
+
+
+def resolve_tasks(selector: str, tasks: list[Task]) -> list[Task]:
+    if not tasks:
+        return []
+    if selector == "all":
+        return tasks
+    if selector == "latest":
+        return [tasks[0]]
+    matches = [t for t in tasks if t.task_id.startswith(selector)]
+    if matches:
+        return matches
+    matches = [t for t in tasks if selector in t.task_id]
+    return matches
+
+
+def filter_by_project(tasks: list[Task], project_filter: str) -> list[Task]:
+    """Keep only sessions whose effective_cwd matches the given project path
+    (prefix match, case-insensitive on Windows)."""
+    if not project_filter:
+        return tasks
+    target = str(Path(project_filter).expanduser().resolve())
+    if sys.platform == "win32":
+        norm = os.path.normcase(target)
+        return [
+            t for t in tasks
+            if t.effective_cwd
+            and os.path.normcase(str(Path(t.effective_cwd))).startswith(norm)
+        ]
+    return [
+        t for t in tasks
+        if t.effective_cwd and str(Path(t.effective_cwd)).startswith(target)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Transcript parsing
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SessionMeta:
+    task_id: str = ""
+    title: str = ""
+    cwd: str = ""
+    decoded_cwd: str = ""
+    git_branch: str = ""
+    version: str = ""
+    entrypoint: str = ""
+    permission_mode: str = ""
+    started_at: str = ""
+    ended_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.__dict__}
+
+
+@dataclass
+class FlatMessage:
+    index: int
+    kind: str
+    role: str
+    timestamp: str
+    uuid: str = ""
+    parent_uuid: str = ""
+    text: str = ""
+    tool_name: str = ""
+    tool_id: str = ""
+    tool_input: Any = None
+    is_error: bool = False
+    attachment_type: str = ""
+    attachment_payload: Any = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.__dict__}
+
+
+def load_transcript(jsonl_path: Path) -> tuple[SessionMeta, list[dict[str, Any]]]:
+    """Read a Claude Code transcript jsonl. The schema is uniform across
+    platforms: each line is a JSON object with one of the types we handle
+    in flatten()."""
+    meta = SessionMeta()
+    raw: list[dict[str, Any]] = []
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            raw.append(obj)
+            if not meta.task_id and obj.get("sessionId"):
+                meta.task_id = obj["sessionId"]
+            # First non-empty cwd wins. A resumed session can appear with
+            # multiple cwds in the same transcript (started in repo A, later
+            # continued from repo B). We want the original project so the
+            # CLAUDE.md / asset paths line up with where the work actually
+            # happened.
+            if obj.get("cwd") and not meta.cwd:
+                meta.cwd = obj["cwd"]
+            if obj.get("gitBranch") and not meta.git_branch:
+                meta.git_branch = obj["gitBranch"]
+            if obj.get("version") and not meta.version:
+                meta.version = obj["version"]
+            if obj.get("entrypoint") and not meta.entrypoint:
+                meta.entrypoint = obj["entrypoint"]
+            if obj.get("permissionMode") and not meta.permission_mode:
+                meta.permission_mode = obj["permissionMode"]
+            ts = obj.get("timestamp")
+            if ts:
+                if not meta.started_at:
+                    meta.started_at = ts
+                meta.ended_at = ts
+            if obj.get("type") == "ai-title" and obj.get("aiTitle"):
+                meta.title = obj["aiTitle"]
+    return meta, raw
+
+
+def merge_task_meta(meta: SessionMeta, task: Task) -> None:
+    if not meta.task_id:
+        meta.task_id = task.task_id
+    if task.title and not meta.title:
+        meta.title = task.title
+    if task.cwd and not meta.cwd:
+        meta.cwd = task.cwd
+    if task.decoded_cwd and not meta.decoded_cwd:
+        meta.decoded_cwd = task.decoded_cwd
+    if not meta.started_at and task.created_at_ms:
+        meta.started_at = datetime.fromtimestamp(
+            task.created_at_ms / 1000, tz=timezone.utc
+        ).isoformat()
+    if task.last_activity_ms:
+        meta.ended_at = datetime.fromtimestamp(
+            task.last_activity_ms / 1000, tz=timezone.utc
+        ).isoformat()
+
+
+def flatten(raw: list[dict[str, Any]]) -> list[FlatMessage]:
+    flat: list[FlatMessage] = []
+    seen_uuid_kind: set[tuple[str, str]] = set()
+    last_text_signature: tuple[str, str, str] | None = None
+
+    def push(**kwargs):
+        u = kwargs.get("uuid") or ""
+        k = kwargs.get("kind") or ""
+        if u and (u, k) in seen_uuid_kind:
+            return
+        nonlocal last_text_signature
+        if k == "text":
+            sig = (kwargs.get("role", ""), k, kwargs.get("text", "") or "")
+            if sig[2] and sig == last_text_signature:
+                return
+            last_text_signature = sig
+        else:
+            last_text_signature = None
+        if u:
+            seen_uuid_kind.add((u, k))
+        flat.append(FlatMessage(index=len(flat), **kwargs))
+
+    for obj in raw:
+        t = obj.get("type")
+        if t in ("queue-operation", "ai-title", "last-prompt"):
+            continue
+        ts = obj.get("timestamp", "") or ""
+        uuid = obj.get("uuid", "") or ""
+        parent = obj.get("parentUuid", "") or ""
+        if t == "attachment":
+            att = obj.get("attachment", {}) or {}
+            push(kind="attachment", role="system", timestamp=ts, uuid=uuid, parent_uuid=parent,
+                 attachment_type=att.get("type", ""), attachment_payload=att)
+            continue
+        msg = obj.get("message") or {}
+        role = msg.get("role", "?")
+        content = msg.get("content")
+        if isinstance(content, str):
+            push(kind="text", role=role, timestamp=ts, uuid=uuid, parent_uuid=parent, text=content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "text":
+                push(kind="text", role=role, timestamp=ts, uuid=uuid, parent_uuid=parent, text=block.get("text", ""))
+            elif bt == "thinking":
+                push(kind="thinking", role=role, timestamp=ts, uuid=uuid, parent_uuid=parent, text=block.get("thinking", ""))
+            elif bt == "tool_use":
+                push(kind="tool_use", role=role, timestamp=ts, uuid=uuid, parent_uuid=parent,
+                     tool_name=block.get("name", ""), tool_id=block.get("id", ""),
+                     tool_input=block.get("input"))
+            elif bt == "tool_result":
+                inner = block.get("content")
+                text = ""
+                if isinstance(inner, str):
+                    text = inner
+                elif isinstance(inner, list):
+                    parts: list[str] = []
+                    for x in inner:
+                        if isinstance(x, dict):
+                            if x.get("type") == "text":
+                                parts.append(x.get("text", ""))
+                            elif x.get("type") == "image":
+                                parts.append("[image]")
+                    text = "\n".join(parts)
+                tur = obj.get("toolUseResult") or {}
+                tur_meta = (
+                    {k: v for k, v in tur.items() if k not in ("stdout", "stderr")}
+                    if isinstance(tur, dict)
+                    else {}
+                )
+                stderr = tur.get("stderr") if isinstance(tur, dict) else None
+                extra = {}
+                if stderr:
+                    extra["stderr"] = stderr
+                if tur_meta:
+                    extra["result_meta"] = tur_meta
+                push(kind="tool_result", role=role, timestamp=ts, uuid=uuid, parent_uuid=parent,
+                     text=text, tool_id=block.get("tool_use_id", ""),
+                     is_error=bool(block.get("is_error")), extra=extra)
+            elif bt == "image":
+                push(kind="image", role=role, timestamp=ts, uuid=uuid, parent_uuid=parent,
+                     extra={"source": block.get("source")})
+            else:
+                push(kind=bt or "unknown", role=role, timestamp=ts, uuid=uuid, parent_uuid=parent,
+                     extra={"raw": block})
+    return flat
+
+
+# ---------------------------------------------------------------------------
+# Touched files (Write / Edit / NotebookEdit / MultiEdit)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TouchedFile:
+    absolute_path: str
+    relative_path: str
+    op: str
+    message_uuid: str
+    exists: bool = False
+    size: int = 0
+    recorded_content: str | None = None
+    edit_only: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        d = self.__dict__.copy()
+        d.pop("recorded_content", None)
+        d["has_recorded_content"] = self.recorded_content is not None
+        return d
+
+
+def collect_touched_files(flat: list[FlatMessage], cwd: str) -> list[TouchedFile]:
+    cwd_p = Path(cwd).resolve() if cwd else None
+    seen: dict[str, TouchedFile] = {}
+    for m in flat:
+        if m.kind != "tool_use":
+            continue
+        inp = m.tool_input or {}
+        if not isinstance(inp, dict):
+            continue
+        path: str | None = None
+        op = m.tool_name
+        if m.tool_name in ("Write", "Edit", "MultiEdit"):
+            path = inp.get("file_path")
+        elif m.tool_name == "NotebookEdit":
+            path = inp.get("notebook_path")
+        if not path:
+            continue
+        try:
+            abs_p = Path(path).resolve()
+        except OSError:
+            continue
+        rel = ""
+        if cwd_p:
+            try:
+                rel = str(abs_p.relative_to(cwd_p))
+            except ValueError:
+                rel = ""
+        key = str(abs_p)
+        tf = seen.get(key)
+        if tf is None:
+            tf = TouchedFile(absolute_path=str(abs_p), relative_path=rel, op=op, message_uuid=m.uuid)
+            seen[key] = tf
+        elif op not in tf.op.split("+"):
+            tf.op = f"{tf.op}+{op}"
+        if m.tool_name == "Write":
+            content = inp.get("content")
+            if isinstance(content, str):
+                tf.recorded_content = content
+    out = list(seen.values())
+    for tf in out:
+        p = Path(tf.absolute_path)
+        try:
+            if p.exists() and p.is_file():
+                tf.exists = True
+                tf.size = p.stat().st_size
+        except OSError:
+            tf.exists = False
+        tf.edit_only = (tf.recorded_content is None) and ("Write" not in tf.op.split("+"))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Renderers
+# ---------------------------------------------------------------------------
+
+def _fmt_ts(ts: str) -> str:
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ts
+
+
+def _human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f}{unit}" if unit != "B" else f"{n}{unit}"
+        n /= 1024
+    return f"{n:.1f}GB"
+
+
+def _strip_uploaded_files_wrapper(text: str) -> str:
+    if not text or "<uploaded_files>" not in text:
+        return text
+    start = text.find("<uploaded_files>")
+    end = text.find("</uploaded_files>")
+    if start == -1 or end == -1:
+        return text
+    return (text[:start] + text[end + len("</uploaded_files>"):]).strip()
+
+
+def render_markdown(
+    meta: SessionMeta,
+    flat: list[FlatMessage],
+    touched: list[TouchedFile],
+    claude_md: Path | None,
+    bundle_root: Path,
+) -> str:
+    out: list[str] = []
+    title = meta.title or f"Claude Code session {meta.task_id[:8]}"
+    out.append(f"# {title}")
+    out.append("")
+    info = [
+        ("Session ID", meta.task_id, True),
+        ("Working dir", meta.cwd or meta.decoded_cwd, True),
+        ("Git branch", meta.git_branch, True),
+        ("Started", _fmt_ts(meta.started_at), False),
+        ("Ended", _fmt_ts(meta.ended_at), False),
+        ("Entrypoint", meta.entrypoint, False),
+        ("Permission mode", meta.permission_mode, False),
+        ("Claude Code", meta.version, True),
+    ]
+    for label, value, mono in info:
+        if not value:
+            continue
+        if mono:
+            out.append(f"- **{label}:** `{value}`")
+        else:
+            out.append(f"- **{label}:** {value}")
+    out.append("")
+
+    if claude_md and claude_md.exists():
+        try:
+            rel = claude_md.relative_to(bundle_root)
+        except ValueError:
+            rel = Path(claude_md.name)
+        out.append(f"- **Project CLAUDE.md:** [{claude_md.name}]({rel}) — "
+                   f"{_human_size(claude_md.stat().st_size)}")
+        out.append("")
+
+    if touched:
+        out.append("## Files written / edited via tool calls")
+        out.append("")
+        for tf in touched:
+            shown = tf.relative_path or tf.absolute_path
+            link = f"[{shown}](assets/{tf.relative_path})" if tf.exists and tf.relative_path else shown
+            status = "" if tf.exists else " _(snapshot recovered from tool input)_"
+            if not tf.exists and tf.recorded_content is None:
+                status = " _(not on disk and no recorded content)_"
+            out.append(f"- `{tf.op}` — {link}{status}")
+        out.append("")
+
+    out.append("## Transcript")
+    out.append("")
+    for m in flat:
+        ts = _fmt_ts(m.timestamp)
+        if m.kind == "text":
+            who = m.role.capitalize()
+            out.append(f"### {who} · {ts}")
+            out.append("")
+            out.append(_strip_uploaded_files_wrapper(m.text).rstrip() or "_(empty)_")
+            out.append("")
+        elif m.kind == "thinking":
+            out.append(f"<details><summary>Thinking · {ts}</summary>")
+            out.append("")
+            out.append(m.text.rstrip())
+            out.append("")
+            out.append("</details>")
+            out.append("")
+        elif m.kind == "tool_use":
+            inp = json.dumps(m.tool_input, ensure_ascii=False, indent=2) if m.tool_input is not None else ""
+            out.append(f"#### Tool call: `{m.tool_name}` · {ts}")
+            out.append("")
+            out.append("```json")
+            out.append(inp)
+            out.append("```")
+            out.append("")
+        elif m.kind == "tool_result":
+            tag = "Tool error" if m.is_error else "Tool result"
+            out.append(f"<details><summary>{tag} · {ts}</summary>")
+            out.append("")
+            txt = m.text or ""
+            note = ""
+            if len(txt) > TOOL_RESULT_TRUNCATE:
+                note = f"\n\n_…truncated, full text in JSON export ({len(txt)} chars)_"
+                txt = txt[:TOOL_RESULT_TRUNCATE]
+            out.append("```")
+            out.append(txt.rstrip())
+            out.append("```")
+            if note:
+                out.append(note)
+            out.append("")
+            out.append("</details>")
+            out.append("")
+        elif m.kind == "attachment":
+            payload = m.attachment_payload or {}
+            preview = json.dumps({k: v for k, v in payload.items() if k != "type"}, ensure_ascii=False)[:400]
+            out.append(f"<details><summary>attachment · {m.attachment_type} · {ts}</summary>")
+            out.append("")
+            out.append("```json")
+            out.append(preview)
+            out.append("```")
+            out.append("")
+            out.append("</details>")
+            out.append("")
+        elif m.kind == "image":
+            out.append(f"_(image attachment · {ts})_")
+            out.append("")
+        else:
+            out.append(f"_({m.kind} · {ts})_")
+            out.append("")
+    return "\n".join(out)
+
+
+HTML_TEMPLATE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+<style>
+:root {{
+  --bg: #fafafa; --fg: #1f2328; --muted: #656d76; --border: #d0d7de;
+  --user-bg: #ddf4ff; --user-bd: #b6e3ff;
+  --asst-bg: #ffffff; --asst-bd: #d0d7de;
+  --tool-bg: #fff8c5; --tool-bd: #eac54f;
+  --result-bg: #dafbe1; --result-bd: #4ac26b;
+  --result-err-bg: #ffebe9; --result-err-bd: #ff8182;
+  --thinking-bg: #f3e8ff; --thinking-bd: #c8a2f5;
+  --att-bg: #f6f8fa; --att-bd: #d0d7de;
+  --code-bg: #0d1117; --code-fg: #e6edf3;
+}}
+* {{ box-sizing: border-box; }}
+html, body {{ margin: 0; padding: 0; }}
+body {{
+  font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Helvetica Neue", Arial, sans-serif;
+  color: var(--fg); background: var(--bg);
+}}
+.wrap {{ max-width: 1080px; margin: 32px auto; padding: 0 20px; }}
+header.head {{
+  background: #fff; border: 1px solid var(--border); border-radius: 10px;
+  padding: 20px 24px; margin-bottom: 24px;
+}}
+header.head h1 {{ margin: 0 0 12px; font-size: 22px; }}
+header.head dl {{
+  display: grid; grid-template-columns: max-content 1fr;
+  gap: 4px 16px; margin: 0; font-size: 13px; color: var(--muted);
+}}
+header.head dt {{ font-weight: 600; color: var(--fg); }}
+header.head dd {{ margin: 0; word-break: break-all; }}
+header.head dd.mono {{ font-family: ui-monospace, Menlo, Consolas, monospace; }}
+.section {{
+  background: #fff; border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 20px; margin-bottom: 24px;
+}}
+.section h2 {{ margin: 0 0 10px; font-size: 15px; }}
+.section ul {{ margin: 0; padding-left: 22px; font-size: 13px; }}
+.section li {{ margin: 3px 0; font-family: ui-monospace, Menlo, Consolas, monospace; }}
+.section .op {{
+  display: inline-block; padding: 1px 6px; margin-right: 6px;
+  border-radius: 4px; background: #eee; font-size: 11px;
+}}
+.section .size {{ color: var(--muted); font-size: 12px; margin-left: 6px; }}
+.toc {{
+  background: #fff; border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 20px 14px; margin-bottom: 24px;
+}}
+.toc h2 {{ margin: 0 0 8px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }}
+.toc ol {{ margin: 0; padding-left: 22px; font-size: 13px; }}
+.toc a {{ color: #0969da; text-decoration: none; }}
+.toc a:hover {{ text-decoration: underline; }}
+section.turn {{
+  border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px;
+  margin-bottom: 22px; background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}}
+section.turn .turn-head {{
+  display: flex; align-items: baseline; gap: 12px;
+  font-size: 12px; color: var(--muted);
+  border-bottom: 1px dashed var(--border); padding-bottom: 8px; margin-bottom: 14px;
+}}
+section.turn .turn-num {{
+  font-weight: 700; color: var(--fg); padding: 2px 8px;
+  background: rgba(9,105,218,0.08); border-radius: 999px; font-size: 11px;
+}}
+section.turn .turn-preview {{
+  flex: 1 1 auto; color: var(--fg); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+section.turn .turn-ts {{ flex: 0 0 auto; font-variant-numeric: tabular-nums; }}
+section.turn .msg {{ margin-bottom: 12px; }}
+section.turn .msg:last-child {{ margin-bottom: 0; }}
+details.process {{
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 14px; margin: 8px 0 14px;
+  background: rgba(0,0,0,0.02);
+}}
+details.process > summary {{ font-weight: 600; color: var(--muted); }}
+details.process[open] > summary {{ color: var(--fg); }}
+details.process .process-meta {{ font-weight: 400; color: var(--muted); margin-left: 4px; }}
+details.process > .msg {{ margin-top: 10px; }}
+details.preamble {{
+  border: 1px dashed var(--border); border-radius: 8px;
+  padding: 10px 14px; margin-bottom: 18px; color: var(--muted);
+}}
+.msg {{
+  border: 1px solid; border-radius: 10px; padding: 14px 18px;
+  margin-bottom: 16px; background: #fff; overflow: hidden;
+}}
+.msg.user {{ background: var(--user-bg); border-color: var(--user-bd); }}
+.msg.assistant {{ background: var(--asst-bg); border-color: var(--asst-bd); }}
+.msg.thinking {{ background: var(--thinking-bg); border-color: var(--thinking-bd); border-style: dashed; }}
+.msg.tool_use {{ background: var(--tool-bg); border-color: var(--tool-bd); }}
+.msg.tool_result {{ background: var(--result-bg); border-color: var(--result-bd); }}
+.msg.tool_result.error {{ background: var(--result-err-bg); border-color: var(--result-err-bd); }}
+.msg.attachment, .msg.image, .msg.unknown {{
+  background: var(--att-bg); border-color: var(--att-bd);
+  color: var(--muted); font-size: 13px;
+}}
+.msg-head {{
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 10px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--muted);
+}}
+.msg-head .role {{ font-weight: 700; }}
+.msg-body {{ font-size: 15px; }}
+.msg-body > *:first-child {{ margin-top: 0; }}
+.msg-body > *:last-child {{ margin-bottom: 0; }}
+.md p, .md ul, .md ol, .md blockquote {{ margin: 0.5em 0; }}
+.md h1, .md h2, .md h3, .md h4 {{ margin: 0.6em 0 0.3em; }}
+.md ul, .md ol {{ padding-left: 1.6em; }}
+.md blockquote {{ border-left: 3px solid var(--border); padding: 0 12px; color: var(--muted); margin-left: 0; }}
+.md pre {{
+  background: var(--code-bg); color: var(--code-fg);
+  padding: 12px 14px; border-radius: 6px; overflow-x: auto;
+  max-height: 520px; margin: 0.5em 0;
+}}
+.md pre code {{ background: transparent; padding: 0; color: inherit; }}
+.md :not(pre) > code {{ background: rgba(175,184,193,0.2); padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }}
+.md table {{ border-collapse: collapse; margin: 0.6em 0; max-width: 100%; display: block; overflow-x: auto; }}
+.md th, .md td {{ border: 1px solid var(--border); padding: 4px 8px; }}
+.md th {{ background: #f6f8fa; }}
+.md img {{ max-width: 100%; height: auto; }}
+code, pre {{ font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }}
+details {{ margin: 6px 0; }}
+details > summary {{ cursor: pointer; color: #444; font-weight: 600; user-select: none; }}
+details[open] > summary {{ margin-bottom: 8px; }}
+.tool-name {{
+  display: inline-block; padding: 2px 8px; border-radius: 4px;
+  background: rgba(0,0,0,0.08); font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px;
+}}
+.truncated {{ color: var(--muted); font-style: italic; font-size: 12px; margin-top: 6px; }}
+pre.raw {{
+  background: var(--code-bg); color: var(--code-fg);
+  padding: 12px 14px; border-radius: 6px; overflow-x: auto;
+  max-height: 520px; margin: 0; white-space: pre-wrap; word-break: break-word;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    --bg: #0d1117; --fg: #e6edf3; --muted: #8b949e; --border: #30363d;
+    --user-bg: #0c2d6b; --user-bd: #1f6feb;
+    --asst-bg: #161b22; --asst-bd: #30363d;
+    --tool-bg: #3d2e00; --tool-bd: #8b6914;
+    --result-bg: #04260f; --result-bd: #2ea043;
+    --result-err-bg: #3d0e0e; --result-err-bd: #f85149;
+    --thinking-bg: #2d1b4e; --thinking-bd: #8957e5;
+    --att-bg: #161b22; --att-bd: #30363d;
+  }}
+  body {{ background: var(--bg); }}
+  header.head, .section, .toc, section.turn {{ background: #161b22; }}
+  section.turn .turn-num {{ background: rgba(88,166,255,0.18); }}
+  details.process {{ background: rgba(255,255,255,0.03); }}
+  .md th {{ background: #161b22; }}
+  .md :not(pre) > code {{ background: rgba(110,118,129,0.4); }}
+  .toc a {{ color: #58a6ff; }}
+}}
+</style>
+</head>
+<body>
+<div class="wrap">
+{header}
+{claude_md}
+{touched}
+{toc}
+{messages}
+</div>
+<script>
+(function () {{
+  const opts = {{ gfm: true, breaks: true, headerIds: false, mangle: false }};
+  if (window.marked && marked.setOptions) marked.setOptions(opts);
+  document.querySelectorAll('.md').forEach(el => {{
+    const raw = el.textContent;
+    el.innerHTML = window.marked ? marked.parse(raw, opts) : raw;
+  }});
+  if (window.hljs) {{
+    document.querySelectorAll('pre code').forEach(el => {{
+      try {{ hljs.highlightElement(el); }} catch (e) {{}}
+    }});
+  }}
+}})();
+</script>
+</body>
+</html>
+"""
+
+
+def render_html(
+    meta: SessionMeta,
+    flat: list[FlatMessage],
+    touched: list[TouchedFile],
+    claude_md: Path | None,
+    bundle_root: Path,
+) -> str:
+    esc = html_mod.escape
+    title = meta.title or f"Claude Code session {meta.task_id[:8]}"
+
+    rows: list[tuple[str, str, bool]] = [
+        ("Session ID", meta.task_id, True),
+        ("Working dir", meta.cwd or meta.decoded_cwd, True),
+        ("Git branch", meta.git_branch, True),
+        ("Started", _fmt_ts(meta.started_at), False),
+        ("Ended", _fmt_ts(meta.ended_at), False),
+        ("Entrypoint", meta.entrypoint, False),
+        ("Permission mode", meta.permission_mode, False),
+        ("Claude Code", meta.version, True),
+    ]
+    head_parts = [f"<header class='head'><h1>{esc(title)}</h1><dl>"]
+    for label, value, mono in rows:
+        if not value:
+            continue
+        cls = " class='mono'" if mono else ""
+        head_parts.append(f"<dt>{esc(label)}</dt><dd{cls}>{esc(str(value))}</dd>")
+    head_parts.append("</dl></header>")
+
+    claude_md_html = ""
+    if claude_md and claude_md.exists():
+        try:
+            rel = claude_md.relative_to(bundle_root)
+        except ValueError:
+            rel = Path(claude_md.name)
+        href = "/".join(html_mod.escape(seg, quote=True) for seg in rel.parts)
+        size = _human_size(claude_md.stat().st_size)
+        claude_md_html = (
+            "<div class='section'><h2>Project CLAUDE.md</h2><ul>"
+            f"<li><a href=\"{href}\">{esc(claude_md.name)}</a>"
+            f"<span class='size'>{esc(size)}</span></li></ul></div>"
+        )
+
+    touched_html = ""
+    if touched:
+        items = []
+        for tf in touched:
+            shown = esc(tf.relative_path or tf.absolute_path)
+            if (tf.exists or tf.recorded_content is not None) and tf.relative_path:
+                href = "assets/" + "/".join(html_mod.escape(seg, quote=True) for seg in tf.relative_path.split("/"))
+                link = f"<a href=\"{href}\">{shown}</a>"
+            else:
+                link = shown
+            if tf.exists:
+                status = ""
+            elif tf.recorded_content is not None:
+                status = " <em>(recovered from tool input)</em>"
+            else:
+                status = " <em>(not on disk; no recorded content)</em>"
+            items.append(f"<li><span class='op'>{esc(tf.op)}</span>{link}{status}</li>")
+        touched_html = (
+            "<div class='section'><h2>Files written / edited via tool calls</h2>"
+            f"<ul>{''.join(items)}</ul></div>"
+        )
+
+    preamble, turns = _split_into_turns(flat)
+
+    toc_items = []
+    for i, turn in enumerate(turns):
+        u = turn["user"]
+        preview_src = _strip_uploaded_files_wrapper(u.text).strip().splitlines()
+        preview = preview_src[0] if preview_src else "(empty)"
+        preview = preview[:80] + ("…" if len(preview) > 80 else "")
+        toc_items.append(f"<li><a href=\"#t{i}\">{esc(preview)}</a></li>")
+    toc_html = ""
+    if toc_items:
+        toc_html = f"<div class='toc'><h2>User prompts</h2><ol>{''.join(toc_items)}</ol></div>"
+
+    parts: list[str] = []
+
+    if preamble:
+        intro_pieces = [_render_block_html(m, esc) for m in preamble if _render_block_html(m, esc)]
+        if intro_pieces:
+            parts.append(
+                "<details class='preamble'><summary>Pre-conversation events "
+                f"({len(intro_pieces)})</summary>{''.join(intro_pieces)}</details>"
+            )
+
+    for i, turn in enumerate(turns):
+        u: FlatMessage = turn["user"]
+        body: list[FlatMessage] = turn["body"]
+        hidden = [m for m in body if m.kind in ("thinking", "tool_use", "tool_result", "attachment", "image", "unknown")]
+        visible_text = [m for m in body if m.kind == "text"]
+
+        ts = esc(_fmt_ts(u.timestamp))
+        user_text = _strip_uploaded_files_wrapper(u.text)
+        prompt_preview = (user_text.strip().splitlines()[0] if user_text.strip() else "(empty)")
+        prompt_preview = prompt_preview[:120] + ("…" if len(prompt_preview) > 120 else "")
+
+        n_tool = sum(1 for m in hidden if m.kind == "tool_use")
+        n_think = sum(1 for m in hidden if m.kind == "thinking")
+        process_summary_bits = []
+        if n_think:
+            process_summary_bits.append(f"{n_think} thinking")
+        if n_tool:
+            process_summary_bits.append(f"{n_tool} tool call{'s' if n_tool != 1 else ''}")
+        n_other = len(hidden) - n_tool - n_think
+        if n_other > 0:
+            process_summary_bits.append(f"{n_other} other")
+        process_summary = " · ".join(process_summary_bits) if process_summary_bits else "no internal steps"
+
+        parts.append(f"<section class='turn' id='t{i}'>")
+        parts.append(
+            f"<div class='turn-head'><span class='turn-num'>#{i + 1}</span>"
+            f"<span class='turn-preview'>{esc(prompt_preview)}</span>"
+            f"<span class='turn-ts'>{ts}</span></div>"
+        )
+        parts.append(
+            f"<div class='msg user'><div class='msg-head'><span class='role'>User</span>"
+            f"<span>{ts}</span></div><div class='msg-body'><div class='md'>{esc(user_text)}</div></div></div>"
+        )
+        if hidden:
+            inner = "".join(_render_block_html(m, esc) for m in hidden)
+            parts.append(
+                f"<details class='process'><summary>Assistant reasoning &amp; tool calls "
+                f"<span class='process-meta'>· {esc(process_summary)}</span></summary>{inner}</details>"
+            )
+        for m in visible_text:
+            parts.append(_render_block_html(m, esc))
+        parts.append("</section>")
+
+    return HTML_TEMPLATE.format(
+        title=esc(title),
+        header="".join(head_parts),
+        claude_md=claude_md_html,
+        touched=touched_html,
+        toc=toc_html,
+        messages="".join(parts),
+    )
+
+
+def _split_into_turns(flat: list[FlatMessage]) -> tuple[list[FlatMessage], list[dict[str, Any]]]:
+    preamble: list[FlatMessage] = []
+    turns: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for m in flat:
+        if m.kind == "text" and m.role == "user":
+            if current is not None:
+                turns.append(current)
+            current = {"user": m, "body": []}
+        elif current is None:
+            preamble.append(m)
+        else:
+            current["body"].append(m)
+    if current is not None:
+        turns.append(current)
+    return preamble, turns
+
+
+def _render_block_html(m: FlatMessage, esc) -> str:
+    ts = esc(_fmt_ts(m.timestamp))
+    anchor = f"m{m.index}"
+    if m.kind == "text":
+        klass = "user" if m.role == "user" else "assistant"
+        label = m.role.capitalize()
+        text = _strip_uploaded_files_wrapper(m.text)
+        body = f"<div class='md'>{esc(text)}</div>"
+        return _msg_html(anchor, klass, label, ts, body)
+    if m.kind == "thinking":
+        body = f"<details open><summary>Reasoning</summary><div class='md'>{esc(m.text)}</div></details>"
+        return _msg_html(anchor, "thinking", "thinking", ts, body)
+    if m.kind == "tool_use":
+        tn = esc(m.tool_name)
+        inp = json.dumps(m.tool_input, ensure_ascii=False, indent=2) if m.tool_input is not None else ""
+        body = (
+            f"<div><span class='tool-name'>{tn}</span></div>"
+            f"<details><summary>Input</summary>"
+            f"<pre><code class='language-json'>{esc(inp)}</code></pre></details>"
+        )
+        return _msg_html(anchor, "tool_use", "tool call", ts, body)
+    if m.kind == "tool_result":
+        klass = "tool_result error" if m.is_error else "tool_result"
+        label = "tool error" if m.is_error else "tool result"
+        txt = m.text or ""
+        note = ""
+        if len(txt) > TOOL_RESULT_TRUNCATE:
+            note = (
+                f"<div class='truncated'>…truncated, full text in JSON export "
+                f"({len(txt)} chars)</div>"
+            )
+            txt = txt[:TOOL_RESULT_TRUNCATE]
+        body = f"<details open><summary>Output</summary><pre class='raw'>{esc(txt)}</pre>{note}</details>"
+        return _msg_html(anchor, klass, label, ts, body)
+    if m.kind == "attachment":
+        atype = esc(m.attachment_type)
+        payload = m.attachment_payload or {}
+        preview = json.dumps({k: v for k, v in payload.items() if k != "type"}, ensure_ascii=False)
+        if len(preview) > 600:
+            preview = preview[:600] + " …"
+        body = f"<details><summary>attachment · {atype}</summary><pre class='raw'>{esc(preview)}</pre></details>"
+        return _msg_html(anchor, "attachment", "attachment", ts, body)
+    if m.kind == "image":
+        return _msg_html(anchor, "image", "image", ts, "<em>(image attachment)</em>")
+    return _msg_html(anchor, "unknown", esc(m.kind), ts, "<em>unhandled block</em>")
+
+
+def _msg_html(anchor: str, klass: str, label: str, ts: str, body: str) -> str:
+    return (
+        f"<div class='msg {klass}' id='{anchor}'>"
+        f"<div class='msg-head'><span class='role'>{label}</span><span>{ts}</span></div>"
+        f"<div class='msg-body'>{body}</div></div>"
+    )
+
+
+def render_json(
+    meta: SessionMeta,
+    flat: list[FlatMessage],
+    touched: list[TouchedFile],
+    claude_md: Path | None,
+    bundle_root: Path,
+) -> str:
+    cmd_entry: dict[str, Any] | None = None
+    if claude_md and claude_md.exists():
+        try:
+            rel = str(claude_md.relative_to(bundle_root))
+        except ValueError:
+            rel = claude_md.name
+        cmd_entry = {
+            "name": claude_md.name,
+            "relative_path": rel,
+            "size": claude_md.stat().st_size,
+        }
+    payload = {
+        "meta": meta.to_dict(),
+        "project_claude_md": cmd_entry,
+        "files": [tf.to_dict() for tf in touched],
+        "messages": [m.to_dict() for m in flat],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def write_csv(path: Path, flat: list[FlatMessage]) -> None:
+    cols = [
+        "index", "timestamp", "role", "kind",
+        "tool_name", "tool_id", "is_error",
+        "preview", "content", "tool_input_json",
+        "uuid", "parent_uuid",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for m in flat:
+            content = m.text
+            if m.kind == "tool_use":
+                content = json.dumps(m.tool_input, ensure_ascii=False) if m.tool_input is not None else ""
+            elif m.kind == "attachment":
+                content = json.dumps(m.attachment_payload, ensure_ascii=False) if m.attachment_payload is not None else ""
+            preview_src = m.text if m.kind != "tool_use" else (m.tool_name or "")
+            preview = (preview_src or "").strip().replace("\n", " ")[:200]
+            w.writerow([
+                m.index, m.timestamp, m.role, m.kind,
+                m.tool_name, m.tool_id, "1" if m.is_error else "",
+                preview, content,
+                json.dumps(m.tool_input, ensure_ascii=False) if m.tool_input is not None else "",
+                m.uuid, m.parent_uuid,
+            ])
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+def export_one(
+    task: Task,
+    output_root: Path,
+    formats: Iterable[str],
+    include_files: bool,
+) -> Path | None:
+    if not task.transcript_path or not task.transcript_path.exists():
+        print(f"  warn: skipping {task.task_id} — no transcript file", file=sys.stderr)
+        return None
+
+    meta, raw = load_transcript(task.transcript_path)
+    merge_task_meta(meta, task)
+    flat = flatten(raw)
+    touched = collect_touched_files(flat, meta.cwd) if include_files else []
+
+    target = output_root / task.task_id
+    target.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(task.transcript_path, target / "transcript.jsonl")
+
+    claude_md_dest: Path | None = None
+    if include_files:
+        src_md = _find_project_claude_md(meta.cwd or meta.decoded_cwd)
+        if src_md is not None:
+            claude_md_dest = target / "CLAUDE.md"
+            try:
+                shutil.copy2(src_md, claude_md_dest)
+            except OSError as e:
+                print(f"  warn: failed to copy CLAUDE.md: {e}", file=sys.stderr)
+                claude_md_dest = None
+
+    if include_files:
+        for tf in touched:
+            src = Path(tf.absolute_path)
+            asset_rel = tf.relative_path or src.name
+            target_path = target / "assets" / asset_rel
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            copied = False
+            if tf.exists:
+                try:
+                    shutil.copy2(src, target_path)
+                    copied = True
+                except OSError:
+                    copied = False
+            if not copied and tf.recorded_content is not None:
+                try:
+                    target_path.write_text(tf.recorded_content, encoding="utf-8")
+                    copied = True
+                except OSError as e:
+                    print(f"  warn: failed to write recorded content for {asset_rel}: {e}", file=sys.stderr)
+            if not copied:
+                if tf.edit_only:
+                    print(
+                        f"  note: {asset_rel} only had Edit/MultiEdit calls and is not readable; "
+                        "skipping (no recorded full content available)",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"  warn: could not snapshot {asset_rel}", file=sys.stderr)
+
+    formats = list(formats)
+    if "html" in formats:
+        (target / "session.html").write_text(
+            render_html(meta, flat, touched, claude_md_dest, target),
+            encoding="utf-8",
+        )
+    if "md" in formats:
+        (target / "session.md").write_text(
+            render_markdown(meta, flat, touched, claude_md_dest, target),
+            encoding="utf-8",
+        )
+    if "json" in formats:
+        (target / "session.json").write_text(
+            render_json(meta, flat, touched, claude_md_dest, target),
+            encoding="utf-8",
+        )
+    if "csv" in formats:
+        write_csv(target / "session.csv", flat)
+
+    _write_readme(target, task, meta, flat, touched, claude_md_dest, formats)
+    return target
+
+
+def _write_readme(
+    target: Path,
+    task: Task,
+    meta: SessionMeta,
+    flat: list[FlatMessage],
+    touched: list[TouchedFile],
+    claude_md: Path | None,
+    formats: list[str],
+) -> None:
+    n_user = sum(1 for m in flat if m.kind == "text" and m.role == "user")
+    n_asst = sum(1 for m in flat if m.kind == "text" and m.role == "assistant")
+    n_tool = sum(1 for m in flat if m.kind == "tool_use")
+    lines = [
+        f"# {meta.title or task.task_id}",
+        "",
+        f"- Session ID: `{meta.task_id}`",
+    ]
+    if meta.cwd or meta.decoded_cwd:
+        lines.append(f"- Working dir: `{meta.cwd or meta.decoded_cwd}`")
+    if meta.git_branch:
+        lines.append(f"- Git branch: `{meta.git_branch}`")
+    if meta.entrypoint:
+        lines.append(f"- Entrypoint: {meta.entrypoint}")
+    if meta.permission_mode:
+        lines.append(f"- Permission mode: {meta.permission_mode}")
+    if meta.version:
+        lines.append(f"- Claude Code: `{meta.version}`")
+    if meta.started_at:
+        lines.append(f"- Started: {_fmt_ts(meta.started_at)}")
+    if meta.ended_at:
+        lines.append(f"- Ended: {_fmt_ts(meta.ended_at)}")
+    lines.append(
+        f"- Messages: {len(flat)} blocks ({n_user} user, {n_asst} assistant, {n_tool} tool calls)"
+    )
+    if touched:
+        lines.append(f"- Files written/edited: {len(touched)}")
+    lines += ["", "## Files in this bundle", ""]
+    if "html" in formats:
+        lines.append("- `session.html` — formatted reading view (open in a browser)")
+    if "md" in formats:
+        lines.append("- `session.md` — Markdown export")
+    if "json" in formats:
+        lines.append("- `session.json` — structured export for LLM consumption")
+    if "csv" in formats:
+        lines.append("- `session.csv` — flat per-block table")
+    lines.append("- `transcript.jsonl` — raw JSONL transcript (lossless source)")
+    if claude_md is not None and claude_md.exists():
+        lines.append("- `CLAUDE.md` — project's CLAUDE.md as it was at export time")
+    if touched:
+        lines.append("- `assets/` — files the assistant Wrote/Edited "
+                     "(live copy if available, recorded-content fallback otherwise)")
+    (target / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    override = (
+        [Path(args.code_root).expanduser().resolve()]
+        if getattr(args, "code_root", None)
+        else None
+    )
+    tasks = discover_sessions(override)
+    project_filter = getattr(args, "project", None)
+    if project_filter:
+        tasks = filter_by_project(tasks, project_filter)
+    if not tasks:
+        root = override[0] if override else CODE_ROOT
+        print(f"No Claude Code sessions found under {root}")
+        if project_filter:
+            print(f"(after filtering by project: {project_filter})", file=sys.stderr)
+        return 0
+
+    # Group by effective cwd; print one project header, then nested sessions.
+    by_project: dict[str, list[Task]] = {}
+    for t in tasks:
+        by_project.setdefault(t.effective_cwd or "(unknown project)", []).append(t)
+
+    # Order projects by the most-recent session's last_activity within each.
+    def project_recency(item):
+        cwd, ts_list = item
+        return max(t.last_activity_ms or t.created_at_ms for t in ts_list)
+
+    for cwd, group in sorted(by_project.items(), key=project_recency, reverse=True):
+        print(cwd)
+        for t in group:
+            title = t.display_title
+            if len(title) > 64:
+                title = title[:61] + "…"
+            when = t.display_when
+            print(f"  {t.task_id}  {when}  {title}")
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    formats = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
+    invalid = [f for f in formats if f not in SUPPORTED_FORMATS]
+    if invalid:
+        print(f"error: unknown format(s): {', '.join(invalid)}", file=sys.stderr)
+        return 2
+
+    override = (
+        [Path(args.code_root).expanduser().resolve()]
+        if getattr(args, "code_root", None)
+        else None
+    )
+    tasks = discover_sessions(override)
+    project_filter = getattr(args, "project", None)
+    if project_filter:
+        tasks = filter_by_project(tasks, project_filter)
+    if not tasks:
+        root = override[0] if override else CODE_ROOT
+        print(f"No Claude Code sessions found under {root}", file=sys.stderr)
+        return 1
+
+    targets = resolve_tasks(args.session, tasks)
+    if not targets:
+        print(f"No session matched '{args.session}'", file=sys.stderr)
+        return 1
+    if len(targets) > 1 and args.session != "all":
+        print(f"Ambiguous selector '{args.session}' matched {len(targets)} sessions:", file=sys.stderr)
+        for t in targets:
+            print(f"  {t.task_id}  {t.display_title}", file=sys.stderr)
+        return 1
+
+    output_root = Path(args.output).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    exported = 0
+    for task in targets:
+        target = export_one(task, output_root, formats, include_files=not args.no_files)
+        if target:
+            print(f"exported {task.task_id} → {target}")
+            exported += 1
+    if not exported:
+        return 1
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="claude_code_export",
+        description="Export Claude Code CLI sessions to HTML, Markdown, JSON, CSV.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              claude_code_export.py list
+              claude_code_export.py list --project ~/code/foo
+              claude_code_export.py export latest
+              claude_code_export.py export <session-id> --output ./exports
+              claude_code_export.py export all --formats html,json
+        """),
+    )
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--code-root",
+        default=None,
+        metavar="PATH",
+        help=(
+            "override the auto-detected Claude Code sessions directory "
+            f"(default: {CODE_ROOT}). Useful for archived backups or alt installs."
+        ),
+    )
+    common.add_argument(
+        "--project",
+        default=None,
+        metavar="PATH",
+        help="filter to sessions whose cwd matches PATH (prefix match).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser(
+        "list", parents=[common], help="list available sessions, grouped by project"
+    ).set_defaults(func=cmd_list)
+
+    pe = sub.add_parser("export", parents=[common], help="export one or more sessions")
+    pe.add_argument("session", help="session id (prefix), 'latest', or 'all'")
+    pe.add_argument(
+        "-o", "--output", "--out",
+        dest="output",
+        default=str(DEFAULT_OUTPUT),
+        metavar="DIR",
+        help=f"directory to write export bundles into (default: {DEFAULT_OUTPUT})",
+    )
+    pe.add_argument(
+        "--formats",
+        default=",".join(SUPPORTED_FORMATS),
+        help=f"comma-separated subset of {','.join(SUPPORTED_FORMATS)} (default: all)",
+    )
+    pe.add_argument("--no-files", action="store_true",
+                    help="skip copying touched files and the project CLAUDE.md")
+    pe.set_defaults(func=cmd_export)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
