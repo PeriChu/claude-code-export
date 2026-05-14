@@ -12,7 +12,7 @@ Zero dependencies (pure Python stdlib, 3.9+). One file, one command.
 > case-insensitive path comparison where needed. The macOS / Linux build
 > lives on the [`macos`](../../tree/macos) branch.
 
-> Sibling project of [claude-cowork-export](https://github.com/<GITHUB_USER>/claude-cowork-export),
+> Sibling project of [claude-cowork-export](https://github.com/PeriChu/claude-cowork-export),
 > which targets Claude Desktop's Cowork chats. This one is for the CLI tool.
 
 ## Why
@@ -50,13 +50,13 @@ python -m pipx ensurepath
 # (open a new shell so PATH picks up)
 
 # install the tool from the windows branch
-pipx install "git+https://github.com/<GITHUB_USER>/claude-code-export.git@windows"
+pipx install "git+https://github.com/PeriChu/claude-code-export.git@windows"
 ```
 
 Or just clone and run the script directly — it has no third-party deps:
 
 ```powershell
-git clone -b windows https://github.com/<GITHUB_USER>/claude-code-export.git
+git clone -b windows https://github.com/PeriChu/claude-code-export.git
 cd claude-code-export
 python claude_code_export.py --help
 ```
@@ -67,7 +67,7 @@ The same script works there too — see the [`macos`](../../tree/macos) branch
 for the canonical version, or install from this branch:
 
 ```bash
-pipx install "git+https://github.com/<GITHUB_USER>/claude-code-export.git@windows"
+pipx install "git+https://github.com/PeriChu/claude-code-export.git@windows"
 ```
 
 ## Usage

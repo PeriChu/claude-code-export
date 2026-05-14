@@ -5,7 +5,7 @@ set -euo pipefail
 
 REPO_NAME="${REPO_NAME:-claude-code-export}"
 REPO_VISIBILITY="${REPO_VISIBILITY:-public}"   # public | private
-REPO_DESCRIPTION="${REPO_DESCRIPTION:-Export Claude Code CLI sessions to HTML / Markdown / JSON / CSV, with the project's CLAUDE.md and any files the assistant touched.}"
+REPO_DESCRIPTION="${REPO_DESCRIPTION:-Export Claude Code CLI sessions to HTML / Markdown / JSON / CSV, with the project CLAUDE.md and any files the assistant touched.}"
 
 cd "$(dirname "$0")"
 
