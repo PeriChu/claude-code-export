@@ -2,9 +2,15 @@
 """claude_code_export — export Claude Code CLI sessions to HTML / Markdown / JSON / CSV.
 
 Claude Code stores each session as a JSONL transcript under
-``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`` on every platform
-(macOS, Linux, Windows alike — Claude Code is a CLI tool, not a Microsoft
-Store app). This tool:
+``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`` on every platform:
+
+    macOS / Linux:  /Users/<you>/.claude/projects/...   (~/.claude/projects)
+    Windows:        C:\\Users\\<you>\\.claude\\projects\\...
+
+This is the Windows branch: it reconfigures the console to UTF-8 so Chinese
+and emoji titles print correctly, and falls back to ``os.path.normcase`` for
+the case-insensitive filesystem when matching touched-file paths against the
+session cwd. The macOS branch lives at ../macos. This tool:
 
   * discovers every transcript on disk
   * groups them by the actual working directory (decoded from the encoded
@@ -42,11 +48,44 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
+
+
 HOME = Path.home()
 CODE_ROOT = HOME / ".claude" / "projects"
 DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
+
+
+def _rel_to(abs_p: Path, base: Path) -> str | None:
+    """Return abs_p relative to base (forward slashes), or None if not under base.
+
+    On Windows we fall back to a case-insensitive comparison via
+    ``os.path.normcase`` because the filesystem is case-insensitive but
+    pathlib's ``relative_to`` is strict.
+    """
+    try:
+        return str(abs_p.relative_to(base)).replace("\\", "/")
+    except ValueError:
+        if sys.platform == "win32":
+            try:
+                a_str = os.path.abspath(str(abs_p))
+                b_str = os.path.abspath(str(base))
+                a_norm = os.path.normcase(a_str)
+                b_norm = os.path.normcase(b_str)
+                if a_norm == b_norm:
+                    return ""
+                if a_norm.startswith(b_norm + os.sep):
+                    return a_str[len(b_str) + 1:].replace("\\", "/")
+            except OSError:
+                pass
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -498,11 +537,10 @@ def collect_touched_files(flat: list[FlatMessage], cwd: str) -> list[TouchedFile
             continue
         rel = ""
         if cwd_p:
-            try:
-                rel = str(abs_p.relative_to(cwd_p))
-            except ValueError:
-                rel = ""
-        key = str(abs_p)
+            r = _rel_to(abs_p, cwd_p)
+            if r is not None:
+                rel = r
+        key = os.path.normcase(str(abs_p)) if sys.platform == "win32" else str(abs_p)
         tf = seen.get(key)
         if tf is None:
             tf = TouchedFile(absolute_path=str(abs_p), relative_path=rel, op=op, message_uuid=m.uuid)

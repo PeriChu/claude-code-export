@@ -1,4 +1,4 @@
-# claude-code-export
+# claude-code-export (Windows branch)
 
 Export **Claude Code CLI** sessions — the JSONL transcripts under
 `~/.claude/projects/...` — to clean HTML / Markdown / JSON / CSV bundles,
@@ -6,6 +6,11 @@ with files the assistant `Write`d / `Edit`ed and the project's `CLAUDE.md`
 captured alongside.
 
 Zero dependencies (pure Python stdlib, 3.9+). One file, one command.
+
+> This is the **Windows branch**. It reconfigures stdout/stderr to UTF-8
+> on Windows so Chinese / emoji titles print correctly, and uses
+> case-insensitive path comparison where needed. The macOS / Linux build
+> lives on the [`macos`](../../tree/macos) branch.
 
 > Sibling project of [claude-cowork-export](https://github.com/<GITHUB_USER>/claude-cowork-export),
 > which targets Claude Desktop's Cowork chats. This one is for the CLI tool.
@@ -31,22 +36,38 @@ session into:
   assistant was operating under.
 - **`transcript.jsonl`** — the lossless source.
 
-## Install
+## Install (Windows)
 
-Requires Python 3.9+.
+Requires Python 3.9+. Get it from the Microsoft Store, [python.org](https://python.org),
+or `winget install Python.Python.3.12`.
 
 Recommended (isolated, gives you a `claude-code-export` command on PATH):
 
-```bash
-pipx install git+https://github.com/<GITHUB_USER>/claude-code-export.git
+```powershell
+# install pipx if you don't have it
+python -m pip install --user pipx
+python -m pipx ensurepath
+# (open a new shell so PATH picks up)
+
+# install the tool from the windows branch
+pipx install "git+https://github.com/<GITHUB_USER>/claude-code-export.git@windows"
 ```
 
 Or just clone and run the script directly — it has no third-party deps:
 
-```bash
-git clone https://github.com/<GITHUB_USER>/claude-code-export.git
+```powershell
+git clone -b windows https://github.com/<GITHUB_USER>/claude-code-export.git
 cd claude-code-export
-python3 claude_code_export.py --help
+python claude_code_export.py --help
+```
+
+### Install (macOS / Linux)
+
+The same script works there too — see the [`macos`](../../tree/macos) branch
+for the canonical version, or install from this branch:
+
+```bash
+pipx install "git+https://github.com/<GITHUB_USER>/claude-code-export.git@windows"
 ```
 
 ## Usage
@@ -113,6 +134,19 @@ exports/<session-id>/
 - **`Edit`/`MultiEdit` only.** If a file was only ever modified via diffs
   and isn't readable from disk, we can't reconstruct it. The bundle's
   README notes which paths fell through.
+- **Windows path quirks.** Windows is case-insensitive but Python's
+  `Path.relative_to` isn't, so the Windows branch normalises with
+  `os.path.normcase` when matching touched-file paths to the session cwd.
+  Long paths (> 260 chars) may fail unless you've enabled
+  `LongPathsEnabled` in the registry.
+- **Console encoding (Windows).** The script reconfigures stdout/stderr to
+  UTF-8 at startup. If you still see mojibake under legacy `cmd.exe`, run
+  `chcp 65001` first, or just use Windows Terminal.
+- **Resumed sessions across cwds.** If a session was started in repo A,
+  then resumed via `claude --continue` in repo B, the transcript carries
+  both cwds. We pick the first non-empty cwd — i.e. the *original* project
+  — so the bundled `CLAUDE.md` and the `assets/` paths line up with where
+  the work actually happened.
 - **Tool-result truncation.** Tool outputs over 8000 chars are truncated in
   HTML / MD for readability. The full text is always preserved in
   `session.json` and `transcript.jsonl`.
