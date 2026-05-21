@@ -48,8 +48,11 @@ DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
 BUNDLE_VERSION = 1
-TOOL_VERSION = "0.2.0"
+TOOL_VERSION = "0.3.0"
 CREDENTIALS_PATH = HOME / ".claude" / ".credentials.json"
+SEED_TEXT_TRUNCATE = 500
+SEED_TOOL_INPUT_TRUNCATE = 200
+SEED_TOOL_RESULT_TRUNCATE = 400
 
 
 # ---------------------------------------------------------------------------
@@ -1791,6 +1794,305 @@ def cmd_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _truncate(text: str, limit: int) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"\n… [truncated, {len(text) - limit} more chars]"
+
+
+def _demote_headers(text: str, by: int = 2) -> str:
+    """Prepend ``by`` more ``#`` chars to any ATX-style heading line so the
+    embedded conversation's headings don't compete with the seed's own
+    structural headings when a reader scans the file."""
+    if not text:
+        return text
+    out = []
+    in_fence = False
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line); continue
+        if in_fence:
+            out.append(line); continue
+        if line.startswith("#"):
+            i = 0
+            while i < len(line) and line[i] == "#":
+                i += 1
+            if 1 <= i <= 6 and (i == len(line) or line[i] in (" ", "\t")):
+                out.append("#" * min(6, i + by) + line[i:])
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _summarise_tool_use(m: FlatMessage) -> str:
+    tn = m.tool_name or "?"
+    inp = m.tool_input if isinstance(m.tool_input, dict) else {}
+    bits = []
+    for key in ("command", "file_path", "notebook_path", "pattern", "path", "url", "query"):
+        v = inp.get(key)
+        if isinstance(v, str) and v:
+            bits.append(f"{key}={_truncate(v, SEED_TOOL_INPUT_TRUNCATE)!r}")
+            break
+    return f"`{tn}`" + (f" ({', '.join(bits)})" if bits else "")
+
+
+def _summarise_tool_result(m: FlatMessage) -> str:
+    txt = (m.text or "").strip()
+    if not txt:
+        return "(empty)"
+    return _truncate(txt, SEED_TOOL_RESULT_TRUNCATE)
+
+
+def _list_bundle_files(bundle: Path) -> list[tuple[str, Path, int]]:
+    """Return (category, relative-path, size) for files in the bundle that
+    are conversation artefacts (assets, CLAUDE.md). Skips the rendered
+    HTML/MD/JSON/CSV / transcript.jsonl / manifest / auth."""
+    out: list[tuple[str, Path, int]] = []
+    md = bundle / "CLAUDE.md"
+    if md.exists() and md.is_file():
+        out.append(("CLAUDE.md", md.relative_to(bundle), md.stat().st_size))
+    assets = bundle / "assets"
+    if assets.is_dir():
+        for p in sorted(assets.rglob("*")):
+            if p.is_file():
+                try:
+                    out.append(("asset", p.relative_to(bundle), p.stat().st_size))
+                except OSError:
+                    pass
+    return out
+
+
+def render_seed_prompt(
+    meta: SessionMeta,
+    flat: list[FlatMessage],
+    bundle_files: list[tuple[str, Path, int]],
+    mode: str,
+    bundle: Path,
+) -> str:
+    if mode not in ("brief", "standard", "full"):
+        raise ValueError(f"unknown seed mode: {mode}")
+    preamble, turns = _split_into_turns(flat)
+    n_user = len(turns)
+    n_tool = sum(1 for m in flat if m.kind == "tool_use")
+    n_think = sum(1 for m in flat if m.kind == "thinking")
+    title = meta.title or f"Claude Code session {meta.task_id[:8]}"
+
+    out: list[str] = []
+    out.append(f"# Continuation of a previous Claude Code session")
+    out.append("")
+    out.append(
+        "I'm resuming a previous Claude Code chat in a fresh conversation. "
+        "Below is the context from the prior session — what we were working on, "
+        "the relevant files, and where we left off. Please read it through, "
+        "then confirm you've absorbed the context and are ready to continue."
+    )
+    out.append("")
+    out.append("---")
+    out.append("")
+    out.append("## Previous session metadata")
+    out.append("")
+    out.append(f"- **Title**: {title}")
+    if meta.version:
+        out.append(f"- **Claude Code version**: `{meta.version}`")
+    if meta.cwd:
+        out.append(f"- **Working dir** (on the original machine): `{meta.cwd}`")
+    if meta.started_at:
+        out.append(f"- **Started**: {_fmt_ts(meta.started_at)}")
+    if meta.ended_at:
+        out.append(f"- **Ended**: {_fmt_ts(meta.ended_at)}")
+    if meta.git_branch:
+        out.append(f"- **Git branch**: `{meta.git_branch}`")
+    out.append(f"- **Activity**: {n_user} user prompt(s), {n_think} reasoning blocks, {n_tool} tool call(s)")
+    out.append("")
+
+    if bundle_files:
+        out.append("## Files carried over from the previous session")
+        out.append("")
+        out.append(
+            "The export bundle contains these files. They have either been "
+            "restored to your working directory by the importer or are sitting "
+            "next to this seed prompt as raw bytes — either way, treat them as "
+            "the canonical state of those paths at the moment the previous "
+            "session ended."
+        )
+        out.append("")
+        for cat, rel, size in bundle_files:
+            tag = "CLAUDE.md" if cat == "CLAUDE.md" else "asset"
+            out.append(f"- `{rel}` ({_human_size(size)}) — {tag}")
+        out.append("")
+
+    if mode == "brief":
+        keep_turns = turns[-3:] if len(turns) > 3 else turns
+        out.append(f"## Last {len(keep_turns)} exchange(s) (verbatim)")
+        out.append("")
+        for i, turn in enumerate(keep_turns, 1):
+            _render_turn_for_seed(out, turn, mode="full", index=n_user - len(keep_turns) + i)
+    else:
+        out.append("## Conversation summary")
+        out.append("")
+        if mode == "standard":
+            out.append(
+                "_Earlier turns are summarised; the final exchange is verbatim. "
+                "Pass `--mode full` to the `seed` command if you need the entire "
+                "conversation reproduced._"
+            )
+            out.append("")
+        for i, turn in enumerate(turns[:-1] if turns else [], 1):
+            _render_turn_for_seed(out, turn, mode=mode, index=i)
+        if turns:
+            out.append("### Final exchange (verbatim)")
+            out.append("")
+            _render_turn_for_seed(out, turns[-1], mode="full", index=n_user)
+
+    out.append("---")
+    out.append("")
+    out.append("## Please continue from here")
+    out.append("")
+    out.append(
+        "1. Confirm you've internalised the context above — note the files in "
+        "scope, the working directory, and where the conversation left off."
+    )
+    out.append(
+        "2. If you would have done something next in the previous session (a "
+        "pending tool call, a follow-up question), surface it now so I can "
+        "approve or correct it."
+    )
+    out.append(
+        "3. Otherwise wait for my next instruction; I'll tell you what to "
+        "tackle next."
+    )
+    out.append("")
+    out.append("**Important**: any absolute paths in the context above point to the")
+    out.append("**original** machine. If a path doesn't exist here, ask me how to")
+    out.append("relocate it before reading or writing it.")
+    out.append("")
+    return "\n".join(out)
+
+
+def _render_turn_for_seed(out: list[str], turn: dict[str, Any], mode: str, index: int) -> None:
+    user_msg: FlatMessage = turn["user"]
+    body: list[FlatMessage] = turn["body"]
+    user_text = _strip_uploaded_files_wrapper(user_msg.text or "").strip()
+    out.append(f"### Turn {index} · {_fmt_ts(user_msg.timestamp)}")
+    out.append("")
+    out.append("**User:**")
+    out.append("")
+    out.append("> " + user_text.replace("\n", "\n> ") if user_text else "> _(empty)_")
+    out.append("")
+
+    asst_text_blocks = [m for m in body if m.kind == "text" and m.role == "assistant"]
+    thinking_blocks = [m for m in body if m.kind == "thinking"]
+    tool_uses = [m for m in body if m.kind == "tool_use"]
+    tool_results = {m.tool_id: m for m in body if m.kind == "tool_result"}
+
+    if mode == "full":
+        for m in body:
+            if m.kind == "text" and m.role == "assistant":
+                out.append("**Assistant:**")
+                out.append("")
+                out.append(_demote_headers(m.text) or "_(empty)_")
+                out.append("")
+            elif m.kind == "thinking":
+                out.append("<details><summary>Reasoning</summary>")
+                out.append("")
+                out.append(m.text or "")
+                out.append("")
+                out.append("</details>")
+                out.append("")
+            elif m.kind == "tool_use":
+                out.append(f"_Tool call:_ {_summarise_tool_use(m)}")
+                tr = tool_results.get(m.tool_id)
+                if tr:
+                    if tr.is_error:
+                        out.append("_Tool error:_")
+                    else:
+                        out.append("_Tool result:_")
+                    out.append("")
+                    out.append("```")
+                    out.append(_summarise_tool_result(tr))
+                    out.append("```")
+                out.append("")
+    elif mode == "standard":
+        if asst_text_blocks:
+            joined = "\n\n".join(b.text or "" for b in asst_text_blocks).strip()
+            out.append("**Assistant** (abridged):")
+            out.append("")
+            out.append(_demote_headers(_truncate(joined, SEED_TEXT_TRUNCATE)) or "_(no textual reply)_")
+            out.append("")
+        if tool_uses:
+            out.append(f"_Tool calls in this turn: {len(tool_uses)}_")
+            for m in tool_uses[:6]:
+                tr = tool_results.get(m.tool_id)
+                marker = " ❌" if tr and tr.is_error else ""
+                out.append(f"- {_summarise_tool_use(m)}{marker}")
+            if len(tool_uses) > 6:
+                out.append(f"- … +{len(tool_uses) - 6} more")
+            out.append("")
+
+
+def cmd_seed(args: argparse.Namespace) -> int:
+    bundle = Path(args.bundle).expanduser().resolve()
+    if not bundle.is_dir():
+        print(f"error: bundle directory does not exist: {bundle}", file=sys.stderr)
+        return 2
+    manifest_path = bundle / "manifest.json"
+    if not manifest_path.exists():
+        print(
+            f"error: not a valid bundle (missing manifest.json): {bundle}\n"
+            "       Bundles produced before tool 0.2.0 lack a manifest and cannot "
+            "be seeded. Re-export first.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"error: failed to parse manifest.json: {e}", file=sys.stderr)
+        return 2
+    if manifest.get("tool") != "claude-code-export":
+        print(
+            f"error: bundle was produced by {manifest.get('tool')!r}, expected "
+            "'claude-code-export'.",
+            file=sys.stderr,
+        )
+        return 2
+
+    transcript = bundle / "transcript.jsonl"
+    if not transcript.exists():
+        print(f"error: bundle missing transcript.jsonl: {transcript}", file=sys.stderr)
+        return 2
+
+    meta, raw = load_transcript(transcript)
+    meta.task_id = manifest.get("source_session_id") or meta.task_id or meta.cli_session_id
+    if not meta.title:
+        meta.title = ""  # may stay empty; renderer handles it
+    if not meta.cwd:
+        meta.cwd = manifest.get("source_cwd", "") or meta.cwd
+    flat = flatten(raw)
+    files = _list_bundle_files(bundle)
+
+    mode = args.mode
+    seed_md = render_seed_prompt(meta, flat, files, mode, bundle)
+
+    out_path = (
+        Path(args.output).expanduser().resolve()
+        if args.output else (bundle / "seed-prompt.md")
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(seed_md, encoding="utf-8")
+    print(f"wrote {out_path}  ({len(seed_md)} chars, mode={mode})")
+    print()
+    print("Use:")
+    print("  1. Open a fresh Claude / Cowork chat under the new account / machine.")
+    print(f"  2. Paste the contents of {out_path} as your first message.")
+    print("  3. Wait for the assistant to confirm context absorption.")
+    print("  4. Continue working as usual.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="claude_code_export",
@@ -1894,6 +2196,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="overwrite existing transcript / restored files / credentials.",
     )
     pi.set_defaults(func=cmd_import)
+
+    ps = sub.add_parser(
+        "seed",
+        help="render seed-prompt.md from a bundle for cross-account continuation",
+        description=(
+            "Produce a self-contained Markdown prompt that can be pasted as the "
+            "first message of a brand-new Claude conversation (potentially under "
+            "a different account / machine) to continue the work from where the "
+            "previous session left off. This does not touch any auth and does "
+            "not rely on server-side state — the new conversation is a fresh "
+            "session with the prior session's context inlined."
+        ),
+    )
+    ps.add_argument("bundle", help="path to an exported bundle directory")
+    ps.add_argument(
+        "--mode", default="standard", choices=("brief", "standard", "full"),
+        help=(
+            "how much of the prior conversation to include. brief = last 3 turns; "
+            "standard (default) = all user prompts + abridged assistant text + "
+            "tool-call summaries + last turn verbatim; full = everything verbatim."
+        ),
+    )
+    ps.add_argument(
+        "-o", "--output", "--out", dest="output", default=None, metavar="PATH",
+        help="where to write the seed prompt (default: <bundle>/seed-prompt.md)",
+    )
+    ps.set_defaults(func=cmd_seed)
 
     return p
 
