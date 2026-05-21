@@ -103,7 +103,7 @@ def _encode_cwd_dir(cwd: str) -> str:
     name Claude Code uses under ``~/.claude/projects/``.
 
       ``/home/me/code/my-project``  →  ``-home-me-code-my-project``
-      ``C:\\code\\my-project``                →  ``C--code-my-project``
+      ``C:\\code\\my-project``      →  ``C--code-my-project``
 
     The transformation is host-platform-independent (host ``os.sep`` is not
     consulted) so we can encode a cross-platform target on import.
@@ -120,7 +120,7 @@ def _decode_cwd_dir(name: str) -> str:
     prepending one. Concrete examples:
 
       ``/home/me/code/my-project``  →  ``-home-me-code-my-project``
-      ``C:\\code\\my-project``                →  ``C--code-my-project``
+      ``C:\\code\\my-project``      →  ``C--code-my-project``
 
     Underscores in the original path are also replaced with ``-``, so the
     encoding is not perfectly reversible. We return a best-effort decode —
@@ -1573,7 +1573,7 @@ def _starts_with_cwd(path: str, src_cwd: str, src_platform: str) -> bool:
     if not p.startswith(c):
         return False
     # Require that the next char (if any) is a separator — avoid matching
-    # /Users/foo as a prefix of /Users/foobar.
+    # /code/foo as a prefix of /code/foobar.
     if len(path) == len(src_cwd):
         return True
     nxt = path[len(src_cwd)]
