@@ -47,11 +47,29 @@ CODE_ROOT = HOME / ".claude" / "projects"
 DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
+BUNDLE_VERSION = 1
+TOOL_VERSION = "0.2.0"
+CREDENTIALS_PATH = HOME / ".claude" / ".credentials.json"
 
 
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
+
+def _encode_cwd_dir(cwd: str) -> str:
+    """Inverse of :func:`_decode_cwd_dir`. Encode a cwd into the directory
+    name Claude Code uses under ``~/.claude/projects/``.
+
+      ``/home/me/code/my-project``  →  ``-home-me-code-my-project``
+      ``C:\\code\\my-project``                →  ``C--code-my-project``
+
+    The transformation is host-platform-independent (host ``os.sep`` is not
+    consulted) so we can encode a cross-platform target on import.
+    """
+    if not cwd:
+        return ""
+    return cwd.replace("\\", "-").replace("/", "-").replace(":", "-").replace("_", "-")
+
 
 def _decode_cwd_dir(name: str) -> str:
     """Best-effort decode of Claude Code's encoded project directory name.
@@ -1138,11 +1156,106 @@ def write_csv(path: Path, flat: list[FlatMessage]) -> None:
 # Driver
 # ---------------------------------------------------------------------------
 
+def _confirm_auth_risk(non_interactive_ack: bool) -> None:
+    msg = textwrap.dedent("""\
+        ⚠️  --include-auth requested.
+            The exported bundle will contain your Anthropic account credentials.
+            Anyone who obtains this bundle can act as your account until you
+            rotate tokens (log out everywhere / change password / revoke device).
+
+            Intended uses:
+              - migrating your own setup to a new device you control
+              - personal backup stored in an encrypted vault (1Password / age / GPG)
+
+            Do NOT:
+              - share this bundle with anyone
+              - upload to unencrypted cloud storage / chat / email
+        """)
+    print(msg, file=sys.stderr)
+    if non_interactive_ack:
+        print("  ack: --yes-i-know-this-is-risky given; proceeding non-interactively.",
+              file=sys.stderr)
+        return
+    try:
+        ans = input('Type "I UNDERSTAND" to proceed: ').strip()
+    except EOFError:
+        ans = ""
+    if ans != "I UNDERSTAND":
+        print("  abort: confirmation phrase not received.", file=sys.stderr)
+        raise SystemExit(3)
+
+
+def _resolve_auth_source() -> Path | None:
+    """Find a portable CC credentials file on this machine.
+
+    Standalone CC stores its OAuth refresh token at
+    ``~/.claude/.credentials.json``. When CC is launched as a subprocess of
+    Claude Desktop, credentials are passed via env and there is no portable
+    file (``CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`` in that case) — return
+    None so callers can surface a clear error.
+    """
+    candidates = [
+        CREDENTIALS_PATH,
+        HOME / ".config" / "claude-code" / "credentials.json",
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+
+def _copy_auth_for_export(target: Path, src: Path) -> dict[str, Any]:
+    auth_dir = target / "auth"
+    auth_dir.mkdir(parents=True, exist_ok=True)
+    dest = auth_dir / "credentials.json"
+    shutil.copy2(src, dest)
+    try:
+        os.chmod(dest, 0o600)
+    except OSError:
+        pass
+    return {
+        "included": True,
+        "files": ["auth/credentials.json"],
+        "source_path": str(src),
+        "encrypted": False,
+    }
+
+
+def _write_manifest(
+    target: Path,
+    task: Task,
+    meta: SessionMeta,
+    auth_info: dict[str, Any] | None,
+) -> None:
+    manifest = {
+        "bundle_version": BUNDLE_VERSION,
+        "tool": "claude-code-export",
+        "tool_version": TOOL_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "source_platform": sys.platform,
+        "source_path_sep": os.sep,
+        "source_home": str(HOME),
+        "source_cwd": meta.cwd or getattr(task, "decoded_cwd", "") or "",
+        "source_session_id": task.task_id,
+        "source_project_dir_name": (
+            task.transcript_path.parent.name if task.transcript_path else ""
+        ),
+        "source_git_branch": meta.git_branch or "",
+        "source_cc_version": meta.version or "",
+        "auth": auth_info or {"included": False},
+    }
+    (target / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def export_one(
     task: Task,
     output_root: Path,
     formats: Iterable[str],
     include_files: bool,
+    auth_source: Path | None = None,
 ) -> Path | None:
     if not task.transcript_path or not task.transcript_path.exists():
         print(f"  warn: skipping {task.task_id} — no transcript file", file=sys.stderr)
@@ -1217,6 +1330,11 @@ def export_one(
     if "csv" in formats:
         write_csv(target / "session.csv", flat)
 
+    auth_info: dict[str, Any] | None = None
+    if auth_source is not None:
+        auth_info = _copy_auth_for_export(target, auth_source)
+
+    _write_manifest(target, task, meta, auth_info)
     _write_readme(target, task, meta, flat, touched, claude_md_dest, formats)
     return target
 
@@ -1347,14 +1465,329 @@ def cmd_export(args: argparse.Namespace) -> int:
     output_root = Path(args.output).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
+    auth_source: Path | None = None
+    if getattr(args, "include_auth", False):
+        auth_source = _resolve_auth_source()
+        if auth_source is None:
+            print(
+                "error: --include-auth requested but no portable credentials file\n"
+                "       was found. Checked:\n"
+                f"         {CREDENTIALS_PATH}\n"
+                f"         {HOME / '.config/claude-code/credentials.json'}\n"
+                "       On hosts where CC runs as a subprocess of Claude Desktop\n"
+                "       (CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1) credentials are\n"
+                "       passed via env and have no portable form. Skip --include-auth\n"
+                "       and sign in on the destination machine instead.",
+                file=sys.stderr,
+            )
+            return 2
+        _confirm_auth_risk(bool(getattr(args, "yes_i_know_this_is_risky", False)))
+
     exported = 0
     for task in targets:
-        target = export_one(task, output_root, formats, include_files=not args.no_files)
+        target = export_one(
+            task,
+            output_root,
+            formats,
+            include_files=not args.no_files,
+            auth_source=auth_source,
+        )
         if target:
             print(f"exported {task.task_id} → {target}")
             exported += 1
     if not exported:
         return 1
+    return 0
+
+
+WINDOWS_RESERVED_CHARS = set('<>:"|?*')
+
+
+def _validate_path_for_windows(path: str) -> str | None:
+    """Return an error string if path is unsafe on Windows, else None.
+    The drive-letter colon at position 1 is tolerated."""
+    if not path:
+        return None
+    head = path[:2]
+    tail = path
+    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
+        tail = path[2:]
+    bad = sorted({c for c in tail if c in WINDOWS_RESERVED_CHARS})
+    if bad:
+        return f"contains chars not allowed on Windows: {''.join(bad)!r}"
+    return None
+
+
+def _starts_with_cwd(path: str, src_cwd: str, src_platform: str) -> bool:
+    """Prefix-match a path against src_cwd, applying case folding when the
+    source platform is Windows (its filesystem is case-insensitive)."""
+    if not path or not src_cwd:
+        return False
+    if len(path) < len(src_cwd):
+        return False
+    p, c = path, src_cwd
+    if src_platform == "win32":
+        p = p.lower()
+        c = c.lower()
+    if not p.startswith(c):
+        return False
+    # Require that the next char (if any) is a separator — avoid matching
+    # /Users/foo as a prefix of /Users/foobar.
+    if len(path) == len(src_cwd):
+        return True
+    nxt = path[len(src_cwd)]
+    return nxt in ("/", "\\")
+
+
+def _rewrite_path(
+    path: str,
+    src_cwd: str,
+    dst_cwd: str,
+    src_sep: str,
+    dst_sep: str,
+    src_platform: str,
+) -> str:
+    if not path:
+        return path
+    if not _starts_with_cwd(path, src_cwd, src_platform):
+        return path
+    tail = path[len(src_cwd):]
+    if src_sep != dst_sep:
+        tail = tail.replace(src_sep, dst_sep)
+    return dst_cwd + tail
+
+
+def _rewrite_jsonl(
+    src_jsonl: Path,
+    dst_jsonl: Path,
+    src_cwd: str,
+    dst_cwd: str,
+    src_sep: str,
+    dst_sep: str,
+    src_platform: str,
+) -> dict[str, int]:
+    """Stream-rewrite src_jsonl → dst_jsonl, updating top-level cwd plus
+    tool_use file_path / notebook_path that fall under the source cwd.
+    Returns counters keyed by rewrite type."""
+    counts = {"cwd": 0, "file_path": 0, "notebook_path": 0, "records": 0}
+    dst_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with src_jsonl.open("r", encoding="utf-8") as fin, \
+            dst_jsonl.open("w", encoding="utf-8") as fout:
+        for line in fin:
+            stripped = line.rstrip("\n")
+            if not stripped.strip():
+                fout.write(line)
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                fout.write(line)
+                continue
+            counts["records"] += 1
+            if isinstance(obj.get("cwd"), str):
+                new = _rewrite_path(obj["cwd"], src_cwd, dst_cwd, src_sep, dst_sep, src_platform)
+                if new != obj["cwd"]:
+                    counts["cwd"] += 1
+                    obj["cwd"] = new
+            msg = obj.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") != "tool_use":
+                            continue
+                        inp = block.get("input")
+                        if not isinstance(inp, dict):
+                            continue
+                        for key in ("file_path", "notebook_path"):
+                            v = inp.get(key)
+                            if isinstance(v, str):
+                                new = _rewrite_path(v, src_cwd, dst_cwd, src_sep, dst_sep, src_platform)
+                                if new != v:
+                                    counts[key] += 1
+                                    inp[key] = new
+            fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    return counts
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    bundle = Path(args.bundle).expanduser().resolve()
+    if not bundle.is_dir():
+        print(f"error: bundle directory does not exist: {bundle}", file=sys.stderr)
+        return 2
+    manifest_path = bundle / "manifest.json"
+    if not manifest_path.exists():
+        print(
+            f"error: not a valid bundle (missing manifest.json): {bundle}\n"
+            f"       Bundles produced before tool version 0.2.0 lack a manifest and\n"
+            f"       cannot be imported. Re-export with the current claude-code-export.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"error: failed to parse manifest.json: {e}", file=sys.stderr)
+        return 2
+    if manifest.get("tool") != "claude-code-export":
+        print(
+            f"error: bundle was produced by {manifest.get('tool')!r}, expected "
+            f"'claude-code-export'.",
+            file=sys.stderr,
+        )
+        return 2
+    if manifest.get("bundle_version", 1) > BUNDLE_VERSION:
+        print(
+            f"error: bundle uses bundle_version={manifest['bundle_version']} but "
+            f"this tool only understands up to {BUNDLE_VERSION}. Upgrade the tool.",
+            file=sys.stderr,
+        )
+        return 2
+
+    src_platform = manifest.get("source_platform") or ""
+    src_sep = manifest.get("source_path_sep") or ("\\" if src_platform == "win32" else "/")
+    src_cwd = manifest.get("source_cwd") or ""
+    session_id = manifest.get("source_session_id") or ""
+    if not session_id or not src_cwd:
+        print("error: manifest missing source_session_id or source_cwd", file=sys.stderr)
+        return 2
+
+    dst_platform = sys.platform
+    dst_sep = "\\" if dst_platform == "win32" else "/"
+
+    if args.cwd:
+        dst_cwd = str(Path(args.cwd).expanduser())
+        # Strip trailing separator for clean prefixing.
+        dst_cwd = dst_cwd.rstrip("/").rstrip("\\") or dst_cwd
+    elif src_platform == dst_platform:
+        dst_cwd = src_cwd
+    else:
+        print(
+            f"error: cross-platform import (source={src_platform}, target={dst_platform}) "
+            "requires --cwd <path> on the target machine.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if dst_platform == "win32":
+        msg = _validate_path_for_windows(dst_cwd)
+        if msg:
+            print(f"error: --cwd {dst_cwd!r} {msg}", file=sys.stderr)
+            return 2
+
+    new_encoded = _encode_cwd_dir(dst_cwd)
+    code_root = (
+        Path(args.code_root).expanduser().resolve()
+        if getattr(args, "code_root", None) else CODE_ROOT
+    )
+    target_jsonl = code_root / new_encoded / f"{session_id}.jsonl"
+    src_jsonl = bundle / "transcript.jsonl"
+    if not src_jsonl.exists():
+        print(f"error: bundle is missing transcript.jsonl: {src_jsonl}", file=sys.stderr)
+        return 2
+
+    bundle_auth = bundle / "auth" / "credentials.json"
+    bundle_claude_md = bundle / "CLAUDE.md"
+    bundle_assets = bundle / "assets"
+    file_plan: list[tuple[Path, Path]] = []
+    if bundle_claude_md.exists():
+        file_plan.append((bundle_claude_md, Path(dst_cwd) / "CLAUDE.md"))
+    if bundle_assets.is_dir():
+        for p in sorted(bundle_assets.rglob("*")):
+            if p.is_file():
+                rel = p.relative_to(bundle_assets)
+                file_plan.append((p, Path(dst_cwd) / rel))
+
+    print(f"Source bundle: {bundle}")
+    print(f"  tool_version:    {manifest.get('tool_version')}")
+    print(f"  exported_at:     {manifest.get('exported_at')}")
+    print(f"  source_platform: {src_platform}")
+    print(f"  source_cwd:      {src_cwd}")
+    print(f"  session_id:      {session_id}")
+    print(f"  manifest.auth.included: {manifest.get('auth', {}).get('included')}")
+    print()
+    print(f"Target ({dst_platform}):")
+    print(f"  cwd:        {dst_cwd}")
+    print(f"  encoded:    {new_encoded}")
+    print(f"  jsonl:      {target_jsonl}")
+    if src_sep != dst_sep:
+        print(f"  separator rewrite: {src_sep!r} → {dst_sep!r}")
+    if file_plan:
+        print(f"  files to restore under cwd: {len(file_plan)}")
+        for src, dst in file_plan[:5]:
+            print(f"    {src.relative_to(bundle)} → {dst}")
+        if len(file_plan) > 5:
+            print(f"    ... +{len(file_plan) - 5} more")
+    install_auth = bundle_auth.exists() and not args.skip_auth
+    if install_auth:
+        print(f"  auth:       {bundle_auth.relative_to(bundle)} → {CREDENTIALS_PATH}")
+    elif bundle_auth.exists():
+        print(f"  auth:       (skipped via --skip-auth; bundle contains credentials)")
+
+    if args.dry_run:
+        print()
+        print("Dry-run: no files written.")
+        return 0
+
+    # Pre-flight: refuse to overwrite without --force.
+    blockers: list[str] = []
+    if target_jsonl.exists() and not args.force:
+        blockers.append(f"{target_jsonl} already exists")
+    if install_auth and CREDENTIALS_PATH.exists() and not args.force:
+        blockers.append(f"{CREDENTIALS_PATH} already exists")
+    if blockers:
+        for b in blockers:
+            print(f"error: {b}", file=sys.stderr)
+        print("       Re-run with --force to overwrite.", file=sys.stderr)
+        return 3
+
+    print()
+    counts = _rewrite_jsonl(
+        src_jsonl, target_jsonl, src_cwd, dst_cwd, src_sep, dst_sep, src_platform,
+    )
+    print(
+        f"wrote {target_jsonl}  "
+        f"(records: {counts['records']}, "
+        f"cwd rewrites: {counts['cwd']}, "
+        f"file_path: {counts['file_path']}, "
+        f"notebook_path: {counts['notebook_path']})"
+    )
+
+    if file_plan:
+        Path(dst_cwd).mkdir(parents=True, exist_ok=True)
+    restored = skipped = 0
+    for src, dst in file_plan:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"  warn: cannot create {dst.parent}: {e}", file=sys.stderr)
+            continue
+        if dst.exists() and not args.force:
+            print(f"  skip (exists): {dst}")
+            skipped += 1
+            continue
+        try:
+            shutil.copy2(src, dst)
+            restored += 1
+        except OSError as e:
+            print(f"  warn: failed to restore {dst}: {e}", file=sys.stderr)
+    if file_plan:
+        print(f"restored {restored} file(s) under cwd, skipped {skipped}.")
+
+    if install_auth:
+        CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundle_auth, CREDENTIALS_PATH)
+        try:
+            os.chmod(CREDENTIALS_PATH, 0o600)
+        except OSError:
+            pass
+        print(f"installed auth: {CREDENTIALS_PATH}")
+
+    print()
+    print("Done. Resume with:")
+    print(f"  claude --resume {session_id}")
     return 0
 
 
@@ -1410,7 +1843,58 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pe.add_argument("--no-files", action="store_true",
                     help="skip copying touched files and the project CLAUDE.md")
+    pe.add_argument(
+        "--include-auth", action="store_true",
+        help=(
+            "HIGH RISK: also include your Anthropic credentials "
+            "(~/.claude/.credentials.json) in the bundle so a matching import "
+            "can resume sessions without re-logging in. Anyone with the bundle "
+            "can act as your account. Interactive 'I UNDERSTAND' prompt by default."
+        ),
+    )
+    pe.add_argument(
+        "--yes-i-know-this-is-risky", action="store_true",
+        help=(
+            "skip the interactive 'I UNDERSTAND' prompt for --include-auth. "
+            "Only meaningful together with --include-auth."
+        ),
+    )
     pe.set_defaults(func=cmd_export)
+
+    pi = sub.add_parser(
+        "import",
+        help="restore a previously exported bundle into ~/.claude/projects/",
+        description=(
+            "Restore a bundle produced by `export` into the local Claude Code "
+            "store. Cross-platform import requires --cwd to be supplied."
+        ),
+    )
+    pi.add_argument("bundle", help="path to an exported bundle directory")
+    pi.add_argument(
+        "--cwd", default=None, metavar="PATH",
+        help=(
+            "target cwd on this machine. Required for cross-platform import "
+            "(macOS↔Windows); optional otherwise (defaults to manifest.source_cwd)."
+        ),
+    )
+    pi.add_argument(
+        "--code-root", default=None, metavar="PATH",
+        help=f"override target ~/.claude/projects/ root (default: {CODE_ROOT}).",
+    )
+    pi.add_argument(
+        "--skip-auth", action="store_true",
+        help="ignore bundle/auth/ even if present; do not touch local credentials.",
+    )
+    pi.add_argument(
+        "--dry-run", action="store_true",
+        help="print the rewrite plan and exit without writing.",
+    )
+    pi.add_argument(
+        "--force", action="store_true",
+        help="overwrite existing transcript / restored files / credentials.",
+    )
+    pi.set_defaults(func=cmd_import)
+
     return p
 
 
