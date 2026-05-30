@@ -149,7 +149,8 @@ session. The selector picks which sessions:
 | `--formats` | `html,md,json,csv` | Comma-separated subset of `html,md,json,csv`. |
 | `--no-files` | _(off)_ | Skip copying touched files and `CLAUDE.md`. Faster, smaller bundle. |
 | `--include-auth` | _(off)_ | **HIGH RISK.** Also copy `~/.claude/.credentials.json` into the bundle so `import` on a fresh machine can resume without re-logging in. See [Security](#security). |
-| `--yes-i-know-this-is-risky` | _(off)_ | Skip the interactive `I UNDERSTAND` prompt when `--include-auth` is set. Only useful in CI. |
+| `--purge-source` | _(off)_ | **DESTRUCTIVE.** After each session's bundle is written and verified, delete that session's local copy from `~/.claude`. Your project/workspace files are never touched. Incompatible with `--no-files`. See [Deleting the local copy](#deleting-the-local-copy-after-export). |
+| `--yes-i-know-this-is-risky` | _(off)_ | Skip the interactive confirmation prompts for `--include-auth` and `--purge-source`. CI only. |
 
 **Examples:**
 
@@ -348,6 +349,42 @@ claude-code-export list --project ~/code/old-project
 claude-code-export export all --project ~/code/old-project --output ./archive
 # Now safe to delete ~/code/old-project — the bundles are independent.
 ```
+
+### 5. Export and free up the local store (`--purge-source`)
+
+```bash
+# Archive a session AND remove its local copy from ~/.claude in one step
+claude-code-export export <session-id> --output ./archive --purge-source
+```
+
+See [Deleting the local copy](#deleting-the-local-copy-after-export) for the
+exact safety behaviour.
+
+---
+
+## Deleting the local copy after export
+
+`--purge-source` lets you offload a session: it is exported to a bundle and
+then removed from `~/.claude`, in a single command.
+
+- **What is deleted**: the session transcript
+  (`~/.claude/projects/<encoded>/<session-id>.jsonl`) and the per-session
+  scratch dir (`~/.claude/session-env/<session-id>/`), plus the encoded
+  project folder if it becomes empty.
+- **What is never touched**: your project / workspace files. The code the
+  assistant wrote or edited in the cwd stays exactly where it is — purge
+  only ever deletes under `~/.claude`.
+- **Verified-before-delete**: a session is purged only after its bundle is
+  written and passes a completeness check (`transcript.jsonl` +
+  `manifest.json` present and non-empty). If export or verification fails,
+  the source is left intact.
+- **Forced confirmation**: the tool prints exactly which paths will be
+  removed and waits for you to type `DELETE`. `--yes-i-know-this-is-risky`
+  skips the prompt for CI only.
+- **Incompatible with `--no-files`**: purging while the bundle omits touched
+  files would make them unrecoverable, so the combination is rejected.
+- **Reversible via import**: `claude-code-export import <bundle>` restores a
+  purged session (see [`import`](#import)).
 
 ---
 

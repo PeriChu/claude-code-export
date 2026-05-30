@@ -62,7 +62,7 @@ DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
 BUNDLE_VERSION = 1
-TOOL_VERSION = "0.3.0"
+TOOL_VERSION = "0.4.0"
 CREDENTIALS_PATH = HOME / ".claude" / ".credentials.json"
 SEED_TEXT_TRUNCATE = 500
 SEED_TOOL_INPUT_TRUNCATE = 200
@@ -1226,6 +1226,94 @@ def _confirm_auth_risk(non_interactive_ack: bool) -> None:
         raise SystemExit(3)
 
 
+def _bundle_is_complete(target: Path) -> bool:
+    """A bundle is safe to purge against only if its lossless core is on disk
+    and non-empty: transcript.jsonl + manifest.json."""
+    for name in ("transcript.jsonl", "manifest.json"):
+        p = target / name
+        try:
+            if not p.is_file() or p.stat().st_size == 0:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _cc_session_purge_targets(task: Task) -> list[Path]:
+    """The exact set of on-disk paths that constitute a CC session's local
+    footprint. Deliberately scoped to ~/.claude — never the project cwd /
+    workspace files the assistant wrote."""
+    out: list[Path] = []
+    if task.transcript_path:
+        out.append(task.transcript_path)
+    env_dir = HOME / ".claude" / "session-env" / task.task_id
+    if env_dir.exists():
+        out.append(env_dir)
+    return out
+
+
+def _confirm_purge_risk(plan: list[tuple[Task, list[Path]]], non_interactive_ack: bool) -> None:
+    n = len(plan)
+    lines = [
+        "",
+        "🔥  --purge-source requested. After a VERIFIED export, the local copy",
+        f"    of {n} session(s) will be PERMANENTLY DELETED from ~/.claude.",
+        "",
+        "    This removes the transcript and per-session scratch only. It does",
+        "    NOT touch your project / workspace files (the code in the cwd that",
+        "    the assistant wrote or edited stays exactly where it is).",
+        "",
+        "    A session is deleted ONLY after its bundle is written and verified",
+        "    (transcript.jsonl + manifest.json present and non-empty). You can",
+        "    later restore it with `claude-code-export import <bundle>`.",
+        "",
+        "    To be deleted:",
+    ]
+    for task, paths in plan:
+        title = task.display_title
+        lines.append(f"      • {task.task_id}  {title}")
+        for p in paths:
+            lines.append(f"          rm  {p}")
+    lines.append("")
+    print("\n".join(lines), file=sys.stderr)
+    if non_interactive_ack:
+        print("  ack: --yes-i-know-this-is-risky given; proceeding non-interactively.",
+              file=sys.stderr)
+        return
+    try:
+        ans = input('Type "DELETE" to confirm purge after export: ').strip()
+    except EOFError:
+        ans = ""
+    if ans != "DELETE":
+        print("  abort: confirmation phrase not received; nothing will be deleted.",
+              file=sys.stderr)
+        raise SystemExit(3)
+
+
+def _purge_paths(paths: list[Path]) -> list[Path]:
+    removed: list[Path] = []
+    for p in paths:
+        try:
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            elif p.exists() or p.is_symlink():
+                p.unlink()
+            else:
+                continue
+            removed.append(p)
+        except OSError as e:
+            print(f"  warn: failed to delete {p}: {e}", file=sys.stderr)
+    # Tidy now-empty parent project dirs (but never remove a non-empty one).
+    for p in paths:
+        parent = p.parent
+        try:
+            if parent.is_dir() and parent.name and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
 def _resolve_auth_source() -> Path | None:
     """Find a portable CC credentials file on this machine.
 
@@ -1506,6 +1594,17 @@ def cmd_export(args: argparse.Namespace) -> int:
     output_root = Path(args.output).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
+    purge_source = bool(getattr(args, "purge_source", False))
+    ack = bool(getattr(args, "yes_i_know_this_is_risky", False))
+    if purge_source and args.no_files:
+        print(
+            "error: --purge-source cannot be combined with --no-files.\n"
+            "       Purging would delete the session while the bundle omits the\n"
+            "       touched files / CLAUDE.md, so they could not be restored.",
+            file=sys.stderr,
+        )
+        return 2
+
     auth_source: Path | None = None
     if getattr(args, "include_auth", False):
         auth_source = _resolve_auth_source()
@@ -1522,9 +1621,14 @@ def cmd_export(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        _confirm_auth_risk(bool(getattr(args, "yes_i_know_this_is_risky", False)))
+        _confirm_auth_risk(ack)
+
+    if purge_source:
+        plan = [(t, _cc_session_purge_targets(t)) for t in targets]
+        _confirm_purge_risk(plan, ack)
 
     exported = 0
+    purged = 0
     for task in targets:
         target = export_one(
             task,
@@ -1536,8 +1640,22 @@ def cmd_export(args: argparse.Namespace) -> int:
         if target:
             print(f"exported {task.task_id} → {target}")
             exported += 1
+            if purge_source:
+                if _bundle_is_complete(target):
+                    removed = _purge_paths(_cc_session_purge_targets(task))
+                    for p in removed:
+                        print(f"  purged {p}")
+                    purged += 1
+                else:
+                    print(
+                        f"  warn: bundle for {task.task_id} failed verification; "
+                        "source NOT purged.",
+                        file=sys.stderr,
+                    )
     if not exported:
         return 1
+    if purge_source:
+        print(f"purged {purged}/{exported} exported session(s) from local store.")
     return 0
 
 
@@ -2193,10 +2311,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     pe.add_argument(
+        "--purge-source", action="store_true",
+        help=(
+            "DESTRUCTIVE: after each session's bundle is written AND verified, "
+            "delete that session's local copy from ~/.claude (transcript + "
+            "per-session scratch). Your project/workspace files are never "
+            "touched. Cannot be combined with --no-files. Interactive 'DELETE' "
+            "prompt by default."
+        ),
+    )
+    pe.add_argument(
         "--yes-i-know-this-is-risky", action="store_true",
         help=(
-            "skip the interactive 'I UNDERSTAND' prompt for --include-auth. "
-            "Only meaningful together with --include-auth."
+            "skip the interactive confirmation prompts for --include-auth "
+            "and --purge-source. For non-interactive / CI use only."
         ),
     )
     pe.set_defaults(func=cmd_export)
