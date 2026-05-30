@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-code-export"
-version = "0.3.0"
+version = "0.4.0"
 description = "Export Claude Code CLI sessions to HTML, Markdown, JSON, CSV — with the project's CLAUDE.md and any files the assistant touched bundled alongside."
 readme = "README.md"
 requires-python = ">=3.9"

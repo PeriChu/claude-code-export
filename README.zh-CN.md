@@ -145,7 +145,8 @@ claude-code-export export <selector> [-o DIR] [--formats LIST]
 | `--formats` | `html,md,json,csv` | 逗号分隔的子集。 |
 | `--no-files` | _(关)_ | 不拷贝触碰文件和 `CLAUDE.md`，bundle 更小更快。 |
 | `--include-auth` | _(关)_ | **高风险**。同时把 `~/.claude/.credentials.json` 装进 bundle，让新机器 `import` 后无需登录直接续聊。详见 [安全](#安全)。 |
-| `--yes-i-know-this-is-risky` | _(关)_ | 跳过 `--include-auth` 的交互式 `I UNDERSTAND` 确认，仅供 CI 使用。 |
+| `--purge-source` | _(关)_ | **破坏性**。每个会话的 bundle 写完并校验通过后，从 `~/.claude` 删掉它的本地副本。**绝不碰**你的项目 / 工作区文件。不能和 `--no-files` 一起用。详见 [导出后删除本地副本](#导出后删除本地副本)。 |
+| `--yes-i-know-this-is-risky` | _(关)_ | 跳过 `--include-auth` 和 `--purge-source` 的交互式确认，仅供 CI 使用。 |
 
 **示例：**
 
@@ -338,6 +339,36 @@ claude-code-export list --project ~/code/old-project
 claude-code-export export all --project ~/code/old-project --output ./archive
 # bundle 是独立的，现在可以安全删掉 ~/code/old-project。
 ```
+
+### 5. 导出并释放本地存储（`--purge-source`）
+
+```bash
+# 归档一个会话，同时把它的本地副本从 ~/.claude 删掉，一条命令搞定
+claude-code-export export <session-id> --output ./archive --purge-source
+```
+
+具体的安全行为见 [导出后删除本地副本](#导出后删除本地副本)。
+
+---
+
+## 导出后删除本地副本
+
+`--purge-source` 让你"卸载"一个会话：先导出成 bundle，再把它从 `~/.claude`
+删掉，一条命令完成。
+
+- **删什么**：会话 transcript（`~/.claude/projects/<encoded>/<session-id>.jsonl`）
+  和每会话 scratch 目录（`~/.claude/session-env/<session-id>/`）；若 encoded
+  项目目录因此变空也一并删掉。
+- **绝不碰什么**：你的项目 / 工作区文件。助手在 cwd 里写过 / 改过的代码原封不动——
+  purge 只删 `~/.claude` 以内的东西。
+- **先校验再删**：只有 bundle 写好且通过完整性检查（`transcript.jsonl` +
+  `manifest.json` 存在且非空）才删源会话。导出或校验失败则源保持不动。
+- **强制确认**：工具会打印将要删除的确切路径，并等你输入 `DELETE`。
+  `--yes-i-know-this-is-risky` 仅供 CI 跳过。
+- **与 `--no-files` 互斥**：bundle 省略触碰文件时再删源会导致不可恢复，所以禁止
+  组合。
+- **可用 import 恢复**：`claude-code-export import <bundle>` 能还原被 purge 的会话
+  （见 [`import`](#import)）。
 
 ---
 
